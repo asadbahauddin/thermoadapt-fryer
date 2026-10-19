@@ -6,8 +6,8 @@ function hasil = analisis_step_test(csvFile, opts)
 %
 %   CSV minimal berisi 3 kolom (nama bisa diatur lewat opts):
 %     opts.kol_t : waktu (s)                         ['elapsed_s']
-%     opts.kol_u : PERINTAH bukaan katup (%)         ['servo_cmd']
-%     opts.kol_y : suhu minyak (degC)                ['temperature']
+%     opts.kol_u : PERINTAH bukaan katup (%)         ['servo_target_pct']
+%     opts.kol_y : suhu minyak (degC)                ['suhu_c']
 %   Pakai perintah servo, bukan sudut terukur: sinyal terukur ber-noise dan
 %   bisa memicu deteksi step palsu.
 %
@@ -27,7 +27,7 @@ function hasil = analisis_step_test(csvFile, opts)
 %     4. Jangan masukkan bahan / ubah gas regulator selama tes.
 
 if nargin < 2, opts = struct(); end
-d = struct('kol_t', 'elapsed_s', 'kol_u', 'servo_cmd', 'kol_y', 'temperature', ...
+d = struct('kol_t', 'elapsed_s', 'kol_u', 'servo_target_pct', 'kol_y', 'suhu_c', ...
     'Ts', 1, 'Ms_maks', 1.7, 'plot', true, 'simpan', true, 'ident', struct());
 f = fieldnames(d);
 for i = 1:numel(f)

@@ -45,7 +45,7 @@ end
 ySens = round((y + 0.15*randn(size(y)))/0.25)*0.25; % noise + kuantisasi MAX31855
 ySens([500 3100 6000]) = NaN;                        % paket hilang
 
-T = table(t, u, ySens, 'VariableNames', {'elapsed_s', 'servo_cmd', 'temperature'});
+T = table(t, u, ySens, 'VariableNames', {'elapsed_s', 'servo_target_pct', 'suhu_c'});
 csv = fullfile(folderOut, 'uji_sintetis_step.csv');
 writetable(T, csv);
 
