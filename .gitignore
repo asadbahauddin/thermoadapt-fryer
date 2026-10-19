@@ -1,0 +1,14 @@
+# dokumen pribadi / proposal tidak dipublikasikan
+*.pdf
+
+# cache & backup MATLAB/Simulink
+Program/slprj/
+*.slxc
+*.slx.original
+*.asv
+
+# data hasil pengujian & cache Python
+Python/data/
+__pycache__/
+*.pyc
+.venv/

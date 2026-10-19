@@ -1,0 +1,105 @@
+/*
+ * PIN SCAN - diagnostik limit switch, Deep Fryer Cerdas (ESP32 DevKit V1 30-pin)
+ * Upload TERPISAH dari firmware utama. Serial Monitor 115200 baud.
+ *
+ * KESELAMATAN: matikan supply 24V TB6600 selama tes. Sketch ini tidak
+ * menyentuh pin STEP/DIR/EN, jadi pin itu mengambang dan driver bisa aktif.
+ *
+ * Cara baca status:
+ *   H = pin ditarik ke 3V3 dari LUAR (pull-up eksternal / modul / jumper 3V3)
+ *   L = pin terhubung ke GND (switch tertutup ke GND / jumper GND)
+ *   F = MENGAMBANG (tidak ada yang menarik pin ke H atau L) -> butuh pull-up
+ *
+ * Pin biasa (15,16,17,21): dibaca dua kali, sekali dengan pull-up internal, sekali
+ *   dengan pull-down internal. Kalau hasilnya ikut pull internal -> F.
+ * Pin input-only (34,35,36,39): tidak punya pull internal, jadi dibaca pakai ADC
+ *   (mV). >2600 mV = H, <300 mV = L, di antaranya = F. Nilai yang lompat-lompat
+ *   juga tanda mengambang.
+ *
+ * Setiap perubahan status (stabil 3 sampel berturut) dicetak: waktu, pin, lama -> baru.
+ * Ketik 's' + Enter di Serial Monitor untuk snapshot semua pin.
+ */
+
+struct ScanPin {
+  uint8_t pin;
+  const char* label;
+  bool inputOnly;
+  char state;    // status terakhir yang dilaporkan
+  char cand;     // kandidat status baru (debounce)
+  uint8_t cnt;
+  uint16_t mv;
+};
+
+ScanPin P[] = {
+  { 34, "Z atas? (D34)",  true,  '?', '?', 0, 0 },
+  { 35, "X akhir (D35)",  true,  '?', '?', 0, 0 },
+  { 36, "bebas (VP)",     true,  '?', '?', 0, 0 },
+  { 39, "X awal? (VN)",   true,  '?', '?', 0, 0 },
+  { 17, "Z bawah (D17)",  false, '?', '?', 0, 0 },
+  { 15, "bebas (D15)",    false, '?', '?', 0, 0 },
+  { 16, "Touch CS (D16)", false, '?', '?', 0, 0 },
+  { 21, "Push btn (D21)", false, '?', '?', 0, 0 },
+};
+const int N = sizeof(P) / sizeof(P[0]);
+
+char classify(ScanPin& p) {
+  if (p.inputOnly) {
+    p.mv = analogReadMilliVolts(p.pin);
+    if (p.mv > 2600) return 'H';
+    if (p.mv < 300)  return 'L';
+    return 'F';
+  }
+  pinMode(p.pin, INPUT_PULLUP);
+  delayMicroseconds(200);
+  bool up = digitalRead(p.pin);
+  pinMode(p.pin, INPUT_PULLDOWN);
+  delayMicroseconds(200);
+  bool dn = digitalRead(p.pin);
+  pinMode(p.pin, INPUT_PULLUP);
+  p.mv = 0;
+  if (up && dn)   return 'H';
+  if (!up && !dn) return 'L';
+  return 'F';
+}
+
+void printPin(const ScanPin& p, char from, char to) {
+  Serial.printf("[%9.3f s] GPIO%-2d %-15s %c -> %c", millis() / 1000.0, p.pin, p.label, from, to);
+  if (p.inputOnly) Serial.printf("  (%u mV)", p.mv);
+  Serial.println();
+}
+
+void snapshot() {
+  Serial.println(F("---- snapshot ----"));
+  for (int i = 0; i < N; i++) {
+    Serial.printf("GPIO%-2d %-15s = %c", P[i].pin, P[i].label, P[i].state);
+    if (P[i].inputOnly) Serial.printf("  (%u mV)", P[i].mv);
+    Serial.println();
+  }
+  Serial.println(F("------------------"));
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);   // rentang ~0..3.1 V
+  Serial.println(F("\nPIN SCAN siap. H=ke 3V3, L=ke GND, F=mengambang. Ketik 's' untuk snapshot."));
+}
+
+void loop() {
+  for (int i = 0; i < N; i++) {
+    ScanPin& p = P[i];
+    char c = classify(p);
+    if (c == p.state) { p.cnt = 0; continue; }
+    if (c == p.cand) p.cnt++; else { p.cand = c; p.cnt = 1; }
+    if (p.cnt >= 3) {
+      printPin(p, p.state, c);
+      p.state = c;
+      p.cnt = 0;
+    }
+  }
+  while (Serial.available()) {
+    if (Serial.read() == 's') snapshot();
+  }
+  delay(5);
+}
