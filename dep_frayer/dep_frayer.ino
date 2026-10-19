@@ -1,8 +1,16 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 11)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 12)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 12 (dari rev 11):
+ *   - SETPOINT suhu: diatur dari web (perintah "sp,<C>", 20-200 C), disimpan di flash,
+ *     digambar putus-putus (oranye) di grafik suhu web. BELUM ada PID: setpoint hanya
+ *     referensi grafik & logger.
+ *   - Pesan WebSocket "temp" ditambah: "sp" (setpoint), "seq" (nomor urut sampel suhu),
+ *     "ms" (millis() saat sampel diambil). Pesan "st" ditambah "sp".
+ *     Dipakai logger Python (folder Python/) untuk mendeteksi paket hilang.
  *
  * REV 11 (dari v10):
  *   - STEPPER Z DIHAPUS dari kode. Pin 26/27/14 sekarang milik BTS7960 (sesuai wiring-mu):
@@ -135,6 +143,12 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define SENSOR_FAULT_MS        5000UL
 #define TEMP_CUTOFF_C          180.0f   // NILAI AWAL: cek titik asap minyak
 
+// ---- SETPOINT SUHU (rev 12) ----
+// Saat ini HANYA referensi untuk grafik web & logger Python; belum ada PID yang memakainya.
+#define DEFAULT_SETPOINT_C     160.0f
+#define SETPOINT_MIN_C          20.0f
+#define SETPOINT_MAX_C         200.0f
+
 // ---------------- OBJEK ----------------
 Adafruit_MAX31855 thermocouple(PIN_MAX_CS);
 TFT_eSPI tft = TFT_eSPI();
@@ -153,6 +167,9 @@ int  spdX = DEFAULT_SPEED_X, accX = DEFAULT_ACCEL_X;
 unsigned long lastStatus = 0;
 
 volatile uint32_t gRaw = 0;
+volatile uint32_t gTempSeq = 0;              // nomor urut sampel suhu (logger mendeteksi paket hilang)
+volatile uint32_t gTempMs  = 0;              // millis() saat sampel suhu diambil
+volatile float gSetpoint = DEFAULT_SETPOINT_C;
 
 // servo state
 int   svUsMin = DEFAULT_SERVO_US_MIN;
@@ -229,6 +246,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div id="temp">--.- &deg;C</div>
     <div id="status" class="err">Menghubungkan...</div>
     <canvas id="c" width="640" height="160"></canvas>
+    <div><small><span style="color:#4ade80">&#9473; suhu</span> &nbsp;
+      <span style="color:#f59e0b">&#9476; setpoint</span></small></div>
+    <div style="margin-top:6px">Setpoint: <b id="spv">--</b> &deg;C &nbsp;
+      <input id="spin" type="number" min="20" max="200" step="0.5">
+      <button onclick="sendSp()">Set</button></div>
+    <small>Setpoint saat ini hanya REFERENSI grafik &amp; logger (firmware belum punya PID).</small>
   </div>
 
   <div class="box">
@@ -330,6 +353,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function send(m){ if (sock && sock.readyState === 1) sock.send(m); else $('log').textContent='Belum terhubung'; }
   function setSA(ax){ send('spd,'+ax+','+$('spd'+ax).value); send('acc,'+ax+','+$('acc'+ax).value); }
   function toggleEn(){ send('en,' + (enState ? 0 : 1)); }
+  function sendSp(){
+    const v = parseFloat($('spin').value);
+    if (!isFinite(v) || v < 20 || v > 200) { $('log').textContent = 'Setpoint harus 20-200 C'; return; }
+    send('sp,' + v.toFixed(1));
+  }
 
   function card(ax, name){
     const steps = [-5000,-1000,-200,-50,50,200,1000,5000];
@@ -344,21 +372,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
   $('cards').innerHTML = card('X','X (Conveyor)');
 
+  // data[i] = {t: suhu|null, sp: setpoint|null}; skala Y mencakup suhu DAN setpoint
   function draw(){
     g.clearRect(0,0,cv.width,cv.height);
-    const v = data.filter(x => x !== null);
+    const v = [];
+    data.forEach(p => { if (p.t !== null) v.push(p.t); if (p.sp !== null) v.push(p.sp); });
     if (v.length < 2) return;
     let lo = Math.min(...v), hi = Math.max(...v);
     if (hi - lo < 5) { const m=(hi+lo)/2; lo=m-2.5; hi=m+2.5; }
-    g.strokeStyle='#4ade80'; g.lineWidth=2; g.beginPath();
-    let started=false;
-    data.forEach((val,i)=>{
-      if (val === null) { started=false; return; }
-      const x = i*(cv.width/(MAXPTS-1));
-      const y = cv.height-10 - (val-lo)/(hi-lo)*(cv.height-20);
-      if(!started){g.moveTo(x,y);started=true;} else g.lineTo(x,y);
-    });
-    g.stroke();
+    const X = i => i*(cv.width/(MAXPTS-1));
+    const Y = val => cv.height-10 - (val-lo)/(hi-lo)*(cv.height-20);
+    function line(key, color, dash){
+      g.strokeStyle=color; g.lineWidth=2; g.setLineDash(dash); g.beginPath();
+      let started=false;
+      data.forEach((p,i)=>{
+        const val = p[key];
+        if (val === null) { started=false; return; }
+        if(!started){g.moveTo(X(i),Y(val));started=true;} else g.lineTo(X(i),Y(val));
+      });
+      g.stroke(); g.setLineDash([]);
+    }
+    line('sp', '#f59e0b', [6,4]);
+    line('t',  '#4ade80', []);
     g.fillStyle='#777'; g.font='12px sans-serif';
     g.fillText(hi.toFixed(1)+' C',4,12); g.fillText(lo.toFixed(1)+' C',4,cv.height-2);
   }
@@ -382,12 +417,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
   function onMsg(m){
     if (m.type === 'temp'){
+      const sp = (typeof m.sp === 'number') ? m.sp : null;
+      if (sp !== null) $('spv').textContent = sp.toFixed(1);
       if (m.ok && m.t !== null){
         $('temp').innerHTML = m.t.toFixed(1)+' &deg;C';
-        $('status').textContent='Sensor OK'; $('status').className='ok'; data.push(m.t);
+        $('status').textContent='Sensor OK'; $('status').className='ok'; data.push({t: m.t, sp: sp});
       } else {
         $('temp').innerHTML='ERR';
-        $('status').textContent='SENSOR ERROR: ' + ({1:'thermocouple LEPAS (open circuit)',2:'short ke GND',4:'short ke VCC'}[m.f] || 'tidak ada data (cek SCK/CS/SO & VCC 3V3)'); $('status').className='err'; data.push(null);
+        $('status').textContent='SENSOR ERROR: ' + ({1:'thermocouple LEPAS (open circuit)',2:'short ke GND',4:'short ke VCC'}[m.f] || 'tidak ada data (cek SCK/CS/SO & VCC 3V3)'); $('status').className='err'; data.push({t: null, sp: sp});
       }
       if (data.length > MAXPTS) data.shift();
       $('info').textContent = 'Uptime ' + m.up + ' s | MAX31855 raw ' + m.raw + ' | ' + m.d;
@@ -401,6 +438,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       enState = m.en;
       $('enbtn').textContent = 'Driver X: ' + (m.en ? 'AKTIF (klik = matikan)' : 'MATI (klik = aktifkan)');
       setField('spdX', m.sx); setField('accX', m.ax);
+      if (typeof m.sp === 'number') { $('spv').textContent = m.sp.toFixed(1); setField('spin', m.sp); }
 
       // servo
       $('sva').textContent = m.sa; $('svg').textContent = m.sg;
@@ -761,6 +799,23 @@ void handleCommand(const char* cmd) {
   if (sscanf(cmd, "svad,%d", &v) == 1) { setServoAngle(svTargetDeg + v); return; }
   if (sscanf(cmd, "sva,%d", &v) == 1)  { setServoAngle((float)v); return; }
   if (sscanf(cmd, "sv,%d", &v) == 1)   { setServoPct(v); return; }
+  // ---- setpoint suhu (rev 12): "sp,<derajat C>" ----
+  if (strncmp(cmd, "sp,", 3) == 0) {
+    char* end = nullptr;
+    float spv = strtof(cmd + 3, &end);
+    if (end == cmd + 3 || !isfinite(spv)) { sendMsg("Setpoint tidak valid"); return; }
+    if (spv < SETPOINT_MIN_C || spv > SETPOINT_MAX_C) {
+      char m[64];
+      snprintf(m, sizeof(m), "Setpoint ditolak: harus %.0f-%.0f C", SETPOINT_MIN_C, SETPOINT_MAX_C);
+      sendMsg(m); return;
+    }
+    gSetpoint = spv;
+    prefs.begin("fryer", false);
+    prefs.putFloat("sp", spv);
+    prefs.end();
+    sendMsg("Setpoint disimpan");
+    return;
+  }
   // ---- motor DC Z ----
   if (sscanf(cmd, "dcz,%d", &v) == 1) { dcSetTarget(v); return; }
   // ---- buzzer ----
@@ -789,11 +844,11 @@ void broadcastStatus() {
   snprintf(b + n, sizeof(b) - n,
     "\"bn\":%d,\"dx\":%d,\"xp\":%ld,\"xm\":%d,\"en\":%d,\"sx\":%d,\"ax\":%d,"
     "\"sa\":%d,\"sg\":%d,\"sr\":%d,\"sl\":%d,\"um\":%d,\"ux\":%d,\"cd\":%d,\"od\":%d,\"tc\":%d,"
-    "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d}",
+    "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f}",
     (int)BENCH_MODE, digitalRead(PIN_X_DIR), stepX.currentPosition(), stepX.distanceToGo() != 0,
     driversEnabled, spdX, accX,
     (int)lroundf(svCurDeg), (int)lroundf(svTargetDeg), (int)svRawUs, (int)svLock, svUsMin, svUsMax, svClosedDeg, svOpenDeg, (int)TEMP_CUTOFF_C,
-    (int)lroundf(dcCur), (int)dcTarget, (int)(dcCap() * 100.0f + 0.5f), (int)MOTOR_SUPPLY_V);
+    (int)lroundf(dcCur), (int)dcTarget, (int)(dcCap() * 100.0f + 0.5f), (int)MOTOR_SUPPLY_V, (float)gSetpoint);
   ws.broadcastTXT(b);
 }
 
@@ -801,11 +856,14 @@ void broadcastTemp() {
   float t = gTemp;
   uint32_t r = gRaw;
   const char* d = rawDiag(r);
-  char b[240];
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000);
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu}",
-                         t, (unsigned long)r, d, millis() / 1000);
+  float sp = gSetpoint;
+  unsigned long seq = gTempSeq, ms = gTempMs;
+  char b[320];
+  // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms);
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms);
   ws.broadcastTXT(b);
 }
 
@@ -954,6 +1012,8 @@ void uiTask(void*) {
       gFault = isnan(tv) ? thermocouple.readError() : 0;
       gTemp = tv;
       if (!isnan(tv)) gLastValidMs = millis();
+      gTempMs = millis();
+      gTempSeq++;
       gTempFresh = true;
       chartPush(tv);
       chartDraw();
@@ -974,7 +1034,10 @@ void setup() {
   svUsMax     = prefs.getInt("usmax", DEFAULT_SERVO_US_MAX);
   svClosedDeg = prefs.getInt("cdeg",  DEFAULT_SERVO_CLOSED_DEG);
   svOpenDeg   = prefs.getInt("odeg",  DEFAULT_SERVO_OPEN_DEG);
+  float spSaved = prefs.getFloat("sp", DEFAULT_SETPOINT_C);
   prefs.end();
+  gSetpoint = (isfinite(spSaved) && spSaved >= SETPOINT_MIN_C && spSaved <= SETPOINT_MAX_C)
+              ? spSaved : DEFAULT_SETPOINT_C;
   svTargetDeg = svCurDeg = (float)svClosedDeg;
   servoPwmBegin();
   servoWriteUs(servoUsFromDeg(svCurDeg));
