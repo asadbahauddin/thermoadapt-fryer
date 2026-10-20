@@ -372,8 +372,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div><small><span style="color:#4ade80">&#9473; suhu</span> &nbsp;
       <span style="color:#f59e0b">&#9476; setpoint</span></small></div>
     <div style="margin-top:6px">Setpoint: <b id="spv">--</b> &deg;C &nbsp;
-      <input id="spin" type="number" min="20" max="200" step="0.5">
+      <input id="spin" type="text" inputmode="decimal" placeholder="mis. 160"
+             onkeydown="if(event.key==='Enter')sendSp()">
       <button onclick="sendSp()">Set</button></div>
+    <div><small>Cara uji: isi setpoint &rarr; Set &rarr; klik <b>MULAI KONTROL</b> di kotak PID Suhu.</small></div>
     <small>Setpoint dipakai PID (maks 165 &deg;C saat PID aktif) dan sebagai referensi grafik.</small>
   </div>
 
@@ -381,8 +383,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <h2>PID Suhu</h2>
     <div class="pos"><span id="pids" class="err">PID mati</span>
       <small>&nbsp; keluaran <b id="pidu">0.0</b>% &nbsp; setpoint efektif <b id="pide">--</b> &deg;C</small></div>
-    <button onclick="send('pid,1')" style="font-size:1.1em">PID ON</button>
-    <button onclick="send('pid,0')" style="font-size:1.1em">PID OFF</button>
+    <button onclick="send('pid,1')" style="font-size:1.1em">MULAI KONTROL (PID ON)</button>
+    <button onclick="send('pid,0')" style="font-size:1.1em">BERHENTI KONTROL (PID OFF)</button>
     <button class="stop" onclick="send('stop')" style="width:auto">STOP</button>
     <div style="margin-top:8px">
       Kp <input id="pkp" type="number" step="0.1" min="0" max="50">
@@ -508,23 +510,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   let sock = null, enState = 0, ledsBuilt = false;
 
   function send(m){ if (sock && sock.readyState === 1) sock.send(m); else $('log').textContent='Belum terhubung'; }
-  function setSA(ax){ send('spd,'+ax+','+$('spd'+ax).value); send('acc,'+ax+','+$('acc'+ax).value); }
+  function setSA(ax){ send('spd,'+ax+','+$('spd'+ax).value); send('acc,'+ax+','+$('acc'+ax).value); clean(['spd'+ax,'acc'+ax]); }
   function toggleEn(){ send('en,' + (enState ? 0 : 1)); }
   function pidSet(){
     const k = ['pkp','pki','pkd','pum'].map(id => parseFloat($(id).value));
     if (k.some(x => !isFinite(x))) { $('log').textContent = 'Parameter PID tidak valid'; return; }
     // dibulatkan supaya perintah tidak melebihi panjang maksimum di firmware
     send('pidk,' + k[0].toFixed(3) + ',' + k[1].toFixed(5) + ',' + k[2].toFixed(3) + ',' + k[3].toFixed(1));
+    clean(['pkp','pki','pkd','pum']);
   }
   function pidLam(){
     const l = ['plp','pli','pld'].map(id => parseFloat($(id).value));
     if (l.some(x => !isFinite(x))) { $('log').textContent = 'Lambda tidak valid'; return; }
     send('pidl,' + l[0].toFixed(4) + ',' + l[1].toFixed(5) + ',' + l[2].toFixed(3));
+    clean(['plp','pli','pld']);
   }
   function sendSp(){
-    const v = parseFloat($('spin').value);
-    if (!isFinite(v) || v < 20 || v > 200) { $('log').textContent = 'Setpoint harus 20-200 C'; return; }
+    const v = parseFloat(String($('spin').value).replace(',', '.'));   // "160,5" juga diterima
+    if (!isFinite(v) || v < 20 || v > 200) { $('log').textContent = 'Setpoint harus angka 20-200 C'; return; }
     send('sp,' + v.toFixed(1));
+    clean(['spin']);
+    $('log').textContent = 'Mengirim setpoint ' + v.toFixed(1) + ' C...';
   }
 
   // ---------- STEP TEST: rekam, gambar, identifikasi ----------
@@ -673,7 +679,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
   }
 
-  function setField(id, val){ const el=$(id); if (document.activeElement !== el) el.value = val; }
+  // Isian yang sudah diketik pengguna (dirty) TIDAK ditimpa status dari ESP sampai dikirim.
+  // Dulu: klik tombol membuat isian kehilangan fokus sesaat, status (tiap 250 ms) menimpanya,
+  // sehingga nilai LAMA yang terkirim -> setpoint/Kp "tidak bisa diubah".
+  function setField(id, val){ const el=$(id); if (document.activeElement !== el && !el.dirty) el.value = val; }
+  document.addEventListener('input', ev => { if (ev.target.tagName === 'INPUT' && ev.target.type !== 'range') ev.target.dirty = true; });
+  function clean(ids){ ids.forEach(id => { $(id).dirty = false; }); }
 
   function onMsg(m){
     if (m.type === 'temp'){
