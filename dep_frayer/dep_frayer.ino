@@ -5,10 +5,11 @@
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
  *
  * REV 15 (dari rev 14):
- *   - BTS7960 sesuai wiring terbaru: GPIO26 = RPWM | GPIO27 = LPWM | GPIO14 = R_EN + L_EN.
+ *   - BTS7960 sesuai wiring terbaru: GPIO27 = RPWM | GPIO26 = LPWM | GPIO14 = R_EN + L_EN
+ *     (RPWM/LPWM sempat tertukar di awal rev 15: 26/27 dibalik setelah dicek pengguna).
  *     GPIO14 mengeluarkan PWM singkat saat boot; dcInit() dijalankan PERTAMA di setup() dan
  *     menahan EN LOW, tetapi selama bootloader (sebelum setup) firmware belum berjalan:
- *     WAJIB pull-down 10k ke GND di EN (14), RPWM (26), dan LPWM (27).
+ *     WAJIB pull-down 10k ke GND di EN (14), RPWM (27), dan LPWM (26).
  *     DC_POS_USES_RPWM dikembalikan ke true. ARAH NAIK/TURUN HARUS DIUJI ULANG.
  *   - SENSOR SUHU: sampling 200 ms, tolak lonjakan > SENSOR_MAX_JUMP_C, HOLD nilai terakhir
  *     maks SENSOR_HOLD_MS saat error, lalu Savitzky-Golay kausal (11 titik, orde 2).
@@ -42,7 +43,7 @@
  *
  * REV 11 (dari v10):
  *   - STEPPER Z DIHAPUS dari kode. Pin 26/27/14 sekarang milik BTS7960
- *       (pemetaan rev 11 di bawah KELIRU, sudah diganti di rev 15: 26 = RPWM, 27 = LPWM, 14 = EN):
+ *       (pemetaan rev 11 di bawah KELIRU, sudah diganti di rev 15: 27 = RPWM, 26 = LPWM, 14 = EN):
  *       GPIO26 = EN (R_EN + L_EN disatukan) | GPIO27 = LPWM | GPIO14 = RPWM
  *     Satu-satunya stepper: X (STEP32, DIR33, EN25).
  *     Pull-down 10k di EN, LPWM, RPWM ke GND (GPIO14 mengeluarkan PWM sesaat saat boot;
@@ -97,8 +98,8 @@
 
 // BTS7960 (rev 15, wiring terbaru; dicek kontinuitas oleh pengguna).
 // Pull-down 10k ke GND di ketiga pin: GPIO14 mengeluarkan PWM singkat saat boot.
-#define PIN_DC_RPWM 26
-#define PIN_DC_LPWM 27
+#define PIN_DC_RPWM 27
+#define PIN_DC_LPWM 26
 #define PIN_DC_EN   14     // R_EN + L_EN BTS7960 (disatukan)
 
 #define PIN_SERVO   13
@@ -149,7 +150,7 @@ IPAddress AP_MASK(255, 255, 255, 0);
 // ---- MOTOR DC Z (BTS7960) ----
 #define MOTOR_SUPPLY_V      24.0f    // tegangan catu modul BTS7960 (ukur dgn multimeter)
 #define MOTOR_RATED_V       12.0f    // tegangan motor; duty maks = RATED / SUPPLY
-#define DC_POS_USES_RPWM    true     // positif (naik) memakai RPWM (GPIO26); false = LPWM
+#define DC_POS_USES_RPWM    true     // positif (naik) memakai RPWM (GPIO27); false = LPWM (GPIO26)
                                      // Dikembalikan ke default (rev 15): koreksi "false" sebelumnya
                                      // dibuat saat pin masih keliru. ARAH BELUM TERVERIFIKASI: uji
                                      // "Naik 25%" sambil tangan di saklar catu daya; bila terbalik
@@ -360,7 +361,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button onclick="send('dcz,0')">Berhenti halus</button>
     <button class="stop" onclick="send('stop')">STOP SEKETIKA</button><br>
     <small>100% = rata-rata 12 V (duty dibatasi di firmware). Berhenti otomatis saat limit kena
-    atau lewat batas waktu.<br>Pin: RPWM GPIO26, LPWM GPIO27, EN GPIO14 (arah belum diverifikasi).</small>
+    atau lewat batas waktu.<br>Pin: RPWM GPIO27, LPWM GPIO26, EN GPIO14 (arah belum diverifikasi).</small>
   </div>
 
   <div class="box">
