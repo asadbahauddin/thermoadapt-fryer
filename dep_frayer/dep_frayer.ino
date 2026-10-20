@@ -1,8 +1,19 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 11)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 15)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 15 (dari rev 14):
+ *   - BTS7960 sesuai wiring terbaru: GPIO26 = RPWM | GPIO27 = LPWM | GPIO14 = R_EN + L_EN.
+ *     GPIO14 mengeluarkan PWM singkat saat boot; dcInit() dijalankan PERTAMA di setup() dan
+ *     menahan EN LOW, tetapi selama bootloader (sebelum setup) firmware belum berjalan:
+ *     WAJIB pull-down 10k ke GND di EN (14), RPWM (26), dan LPWM (27).
+ *     DC_POS_USES_RPWM dikembalikan ke true. ARAH NAIK/TURUN HARUS DIUJI ULANG.
+ *   - SENSOR SUHU: sampling 200 ms, tolak lonjakan > SENSOR_MAX_JUMP_C, HOLD nilai terakhir
+ *     maks SENSOR_HOLD_MS saat error, lalu Savitzky-Golay kausal (11 titik, orde 2).
+ *     gTemp = nilai tersaring. Pesan "temp" (tetap 1 Hz) ditambah "tr" (mentah), "held", "ec".
+ *     SENSOR_FILTER_ENABLE 0 = perilaku lama (tanpa tolak lonjakan/hold/SG).
  *
  * REV 14 (dari rev 13):
  *   - STEP TEST open-loop (tampil di web saja): servo dipindah ke satu bukaan tetap dari
@@ -30,11 +41,13 @@
  *   - Pesan WebSocket "temp" ditambah "sp", "seq", "ms"; pesan "st" ditambah "sp".
  *
  * REV 11 (dari v10):
- *   - STEPPER Z DIHAPUS dari kode. Pin 26/27/14 sekarang milik BTS7960 (sesuai wiring-mu):
+ *   - STEPPER Z DIHAPUS dari kode. Pin 26/27/14 sekarang milik BTS7960
+ *       (pemetaan rev 11 di bawah KELIRU, sudah diganti di rev 15: 26 = RPWM, 27 = LPWM, 14 = EN):
  *       GPIO26 = EN (R_EN + L_EN disatukan) | GPIO27 = LPWM | GPIO14 = RPWM
  *     Satu-satunya stepper: X (STEP32, DIR33, EN25).
  *     Pull-down 10k di EN, LPWM, RPWM ke GND (GPIO14 mengeluarkan PWM sesaat saat boot;
  *     karena EN ada di GPIO26 dan ditarik LOW, motor tetap diam saat boot).
+ *     [Alasan ini TIDAK berlaku lagi sejak rev 15: EN sekarang di GPIO14; lihat REV 15.]
  *   - SERVO 180 derajat, MODE KALIBRASI TANPA PEMBATAS (servo belum dipasang ke gas):
  *       * Slider/tombol sudut 0-180, tombol relatif +-1/+-5/+-10.
  *       * "Simpan sebagai TUTUP/BUKA": menyimpan sudut yang sedang dipakai ke flash.
@@ -82,9 +95,11 @@
 #define PIN_X_DIR  33
 #define PIN_X_EN   25
 
-#define PIN_DC_EN   26     // R_EN + L_EN BTS7960
+// BTS7960 (rev 15, wiring terbaru; dicek kontinuitas oleh pengguna).
+// Pull-down 10k ke GND di ketiga pin: GPIO14 mengeluarkan PWM singkat saat boot.
+#define PIN_DC_RPWM 26
 #define PIN_DC_LPWM 27
-#define PIN_DC_RPWM 14
+#define PIN_DC_EN   14     // R_EN + L_EN BTS7960 (disatukan)
 
 #define PIN_SERVO   13
 #define PIN_TFT_RST 15     // RESET modul layar (dipulsa manual di uiTask)
@@ -134,7 +149,11 @@ IPAddress AP_MASK(255, 255, 255, 0);
 // ---- MOTOR DC Z (BTS7960) ----
 #define MOTOR_SUPPLY_V      24.0f    // tegangan catu modul BTS7960 (ukur dgn multimeter)
 #define MOTOR_RATED_V       12.0f    // tegangan motor; duty maks = RATED / SUPPLY
-#define DC_POS_USES_RPWM    false    // positif (naik) memakai RPWM (GPIO14); false = LPWM
+#define DC_POS_USES_RPWM    true     // positif (naik) memakai RPWM (GPIO26); false = LPWM
+                                     // Dikembalikan ke default (rev 15): koreksi "false" sebelumnya
+                                     // dibuat saat pin masih keliru. ARAH BELUM TERVERIFIKASI: uji
+                                     // "Naik 25%" sambil tangan di saklar catu daya; bila terbalik
+                                     // ubah ke false. Interlock limit Z bergantung pada arah ini.
 #define DC_PWM_FREQ         20000
 #define DC_PWM_BITS         10
 #define DC_LEDC_CH_R        2        // hanya core ESP32 v2 (servo memakai kanal 0)
@@ -159,6 +178,15 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define SERVO_SAFETY           false    // true: paksa katup ke sudut TUTUP bila sensor error/suhu lewat batas
 #define SENSOR_FAULT_MS        5000UL
 #define TEMP_CUTOFF_C          180.0f   // NILAI AWAL: cek titik asap minyak
+
+// ---- PENANGANAN SENSOR SUHU (rev 15) ----
+#define SENSOR_FILTER_ENABLE   1        // 0 = perilaku lama: gTemp = bacaan mentah (tanpa tolak lonjakan/hold/SG)
+#define SENSOR_SAMPLE_MS       200UL    // periode baca MAX31855 (konversi internal ~100 ms)
+#define SENSOR_PUBLISH_EVERY   5        // kirim ke web/logger & grafik LCD tiap 5 sampel = 1 Hz (seperti sebelumnya)
+#define SENSOR_MAX_JUMP_C      5.0f     // beda > ini dari sampel valid terakhir = lonjakan, ditolak
+                                        // (minyak fisik tidak berubah 5 C dalam 200 ms)
+#define SENSOR_HOLD_MS         3000UL   // tahan nilai tersaring terakhir maks selama ini saat error
+static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_FAULT_MS (pengaman sensor)");
 
 // ---- SETPOINT SUHU (rev 12) ----
 // Saat ini HANYA referensi untuk grafik web & logger; belum ada PID yang memakainya.
@@ -187,6 +215,9 @@ volatile uint32_t gRaw = 0;
 volatile uint32_t gTempSeq = 0;              // nomor urut sampel suhu (deteksi paket hilang)
 volatile uint32_t gTempMs  = 0;              // millis() saat sampel suhu diambil
 volatile float gSetpoint = DEFAULT_SETPOINT_C;
+volatile float gTempRaw = NAN;               // bacaan mentah MAX31855 terakhir (NAN bila fault)
+volatile bool  gTempHeld = false;            // true: gTemp = nilai ditahan (sensor error sesaat)
+volatile uint32_t gErrCount = 0;             // jumlah sampel tidak valid (fault/lonjakan) sejak boot
 
 // servo state
 int   svUsMin = DEFAULT_SERVO_US_MIN;
@@ -329,7 +360,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button onclick="send('dcz,0')">Berhenti halus</button>
     <button class="stop" onclick="send('stop')">STOP SEKETIKA</button><br>
     <small>100% = rata-rata 12 V (duty dibatasi di firmware). Berhenti otomatis saat limit kena
-    atau lewat batas waktu.</small>
+    atau lewat batas waktu.<br>Pin: RPWM GPIO26, LPWM GPIO27, EN GPIO14 (arah belum diverifikasi).</small>
   </div>
 
   <div class="box">
@@ -534,14 +565,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (sp !== null) $('spv').textContent = sp.toFixed(1);
       if (m.ok && m.t !== null){
         $('temp').innerHTML = m.t.toFixed(1)+' &deg;C';
-        $('status').textContent='Sensor OK'; $('status').className='ok'; data.push({t: m.t, sp: sp});
+        if (m.held) { $('status').textContent='HELD: nilai ditahan (sensor error sesaat)'; $('status').className='err'; }
+        else { $('status').textContent='Sensor OK'; $('status').className='ok'; }
+        data.push({t: m.t, sp: sp});
       } else {
         $('temp').innerHTML='ERR';
         $('status').textContent='SENSOR ERROR: ' + ({1:'thermocouple LEPAS (open circuit)',2:'short ke GND',4:'short ke VCC'}[m.f] || 'tidak ada data (cek SCK/CS/SO & VCC 3V3)'); $('status').className='err'; data.push({t: null, sp: sp});
       }
       if (data.length > MAXPTS) data.shift();
       if (typeof m.st === 'number') stepFeed(m);
-      $('info').textContent = 'Uptime ' + m.up + ' s | MAX31855 raw ' + m.raw + ' | ' + m.d;
+      $('info').textContent = 'Uptime ' + m.up + ' s | MAX31855 raw ' + m.raw + ' | ' + m.d
+        + (typeof m.ec === 'number' ? ' | error sensor: ' + m.ec : '')
+        + (typeof m.tr === 'number' ? ' | mentah ' + m.tr.toFixed(2) + ' C' : (m.tr === null ? ' | mentah: -' : ''));
       draw();
     } else if (m.type === 'st'){
       updLeds(m);
@@ -1031,12 +1066,18 @@ void broadcastTemp() {
   const char* d = rawDiag(r);
   float sp = gSetpoint;
   unsigned long seq = gTempSeq, ms = gTempMs;
-  char b[320];
+  // rev 15: tr = mentah (null bila fault), held = nilai ditahan, ec = jumlah error sejak boot
+  float tr = gTempRaw;
+  char trs[16];
+  if (isnan(tr)) strcpy(trs, "null"); else snprintf(trs, sizeof(trs), "%.2f", tr);
+  int held = gTempHeld ? 1 : 0;
+  unsigned long ec = gErrCount;
+  char b[400];
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS());
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS());
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec);
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec);
   ws.broadcastTXT(b);
 }
 
@@ -1126,10 +1167,12 @@ void uiUpdate() {
     snprintf(b, sizeof(b), "ERR %08lX %s", (unsigned long)gRaw, gRaw == 0 ? "SO=LOW" : (gRaw == 0xFFFFFFFFUL ? "SO=HIGH" : why));
     putText(fSens, b, 10, 86, 2, TFT_RED, 470);
   } else {
+    bool held = gTempHeld;
     snprintf(b, sizeof(b), "%.1f C", t);
-    putText(fTemp, b, 10, 34, 6, TFT_WHITE, 250);
-    snprintf(b, sizeof(b), "Sensor OK  raw %08lX", (unsigned long)gRaw);
-    putText(fSens, b, 10, 86, 2, TFT_GREEN, 470);
+    putText(fTemp, b, 10, 34, 6, held ? TFT_YELLOW : TFT_WHITE, 250);
+    if (held) snprintf(b, sizeof(b), "HELD (error sesaat) raw %08lX", (unsigned long)gRaw);
+    else      snprintf(b, sizeof(b), "Sensor OK  raw %08lX", (unsigned long)gRaw);
+    putText(fSens, b, 10, 86, 2, held ? TFT_YELLOW : TFT_GREEN, 470);
   }
 
   for (int i = 0; i < LS_COUNT; i++) {
@@ -1167,6 +1210,84 @@ void tftHardReset() {
   digitalWrite(PIN_TFT_RST, HIGH); delay(150);
 }
 
+// ---------------- FILTER SENSOR SUHU (rev 15) ----------------
+// Urutan per sampel (200 ms): fault MAX31855 / NaN -> tidak valid; beda > SENSOR_MAX_JUMP_C
+// dari sampel valid terakhir -> lonjakan, tidak valid. Sampel valid masuk jendela SG.
+// Sampel tidak valid: HOLD (output = nilai tersaring terakhir, nilai itu juga diisikan ke
+// jendela supaya jarak waktu antar sampel tetap seragam) selama <= SENSOR_HOLD_MS sejak sampel
+// valid terakhir. Lewat itu: output NAN (perilaku lama -> pengaman servo/step test bekerja),
+// jendela dikosongkan, dan sampel valid berikutnya diterima tanpa cek lonjakan sebagai acuan
+// baru (agar acuan yang keliru tidak mengunci sensor selamanya).
+//
+// SAVITZKY-GOLAY KAUSAL: jendela 11 sampel, polinomial orde 2, dievaluasi di titik TERAKHIR
+// jendela (end-point) sehingga hanya memakai sampel masa lalu. Koefisien dibuat di PC, BUKAN
+// dihitung di ESP32:
+//     from scipy.signal import savgol_coeffs
+//     savgol_coeffs(11, 2, pos=10, use='dot')   # scipy 1.10.1; urutan sampel terlama -> terbaru
+// Hasilnya pecahan eksak berpenyebut 143: [18, 2, -9, -15, -16, -12, -3, 11, 30, 54, 83] / 143,
+// jumlah = 143/143 = 1 (gain DC = 1).
+// SIFAT (diuji di Python, lihat laporan rev 15), dan BUKAN "jeda ~5 sampel": karena fit
+// polinomial orde 2 dievaluasi di titik ujung, rampa dan kurva kuadrat diteruskan TANPA jeda
+// (kenaikan suhu linear tidak tertunda, jadi dead time step test tidak bertambah oleh filter
+// untuk respons yang mulus). Harganya: penghalusan lemah (std noise turun hanya ke ~76%),
+// 58% lonjakan yang lolos prefilter ikut masuk ke output, dan respons terhadap loncatan
+// mendadak overshoot ~25% lalu undershoot ~14% selama ~2 detik. Jadi nilai SG pada transien
+// tajam BISA sesaat lebih tinggi/rendah dari mentah. Prefilter lonjakan di atas menahan
+// sebagian besar lonjakan sebelum masuk SG.
+// Awal data / setelah reset: output = sampel mentah sampai jendela penuh (11 sampel = 2,2 s).
+#define SG_WINDOW 11
+static const float SG_COEF[SG_WINDOW] = {
+  18.0f / 143, 2.0f / 143, -9.0f / 143, -15.0f / 143, -16.0f / 143, -12.0f / 143,
+  -3.0f / 143, 11.0f / 143, 30.0f / 143, 54.0f / 143, 83.0f / 143
+};
+
+struct SensorFilter {
+  float    win[SG_WINDOW];   // buffer sirkular
+  uint8_t  n = 0, head = 0;  // jumlah terisi, posisi tulis berikutnya
+  bool     haveRef = false;  // ada sampel valid acuan
+  float    lastGood = NAN;   // sampel valid terakhir (acuan lonjakan)
+  float    lastOut  = NAN;   // output tersaring terakhir (yang ditahan saat error)
+  uint32_t lastGoodMs = 0;
+
+  void reset() { n = 0; head = 0; haveRef = false; }
+  void push(float v) { win[head] = v; head = (head + 1) % SG_WINDOW; if (n < SG_WINDOW) n++; }
+  float sg() const {                       // jendela penuh: urut terlama -> terbaru
+    float s = 0;
+    for (int k = 0; k < SG_WINDOW; k++) s += SG_COEF[k] * win[(head + k) % SG_WINDOW];
+    return s;
+  }
+};
+SensorFilter sf;
+
+// Proses satu sampel. Mengembalikan nilai untuk gTemp; *held = nilai ditahan;
+// *accepted = sampel valid diterima (hanya ini yang memperbarui gLastValidMs).
+float sensorFilterStep(float tv, uint32_t now, bool* held, bool* accepted) {
+  *held = false; *accepted = false;
+  bool valid = !isnan(tv);
+#if SENSOR_FILTER_ENABLE
+  if (valid && sf.haveRef && fabsf(tv - sf.lastGood) > SENSOR_MAX_JUMP_C) valid = false;   // lonjakan
+  if (!valid) gErrCount = gErrCount + 1;
+  if (valid) {
+    sf.haveRef = true; sf.lastGood = tv; sf.lastGoodMs = now;
+    sf.push(tv);
+    sf.lastOut = (sf.n < SG_WINDOW) ? tv : sf.sg();
+    *accepted = true;
+    return sf.lastOut;
+  }
+  if (sf.haveRef && (now - sf.lastGoodMs) <= SENSOR_HOLD_MS) {   // HOLD
+    sf.push(sf.lastOut);
+    *held = true;
+    return sf.lastOut;
+  }
+  sf.reset();                                                     // lewat batas hold
+  return NAN;
+#else
+  if (!valid) gErrCount = gErrCount + 1;
+  *accepted = valid;
+  return tv;                                                      // perilaku lama
+#endif
+}
+
 void uiTask(void*) {
   tftHardReset();
   tft.init();
@@ -1174,31 +1295,41 @@ void uiTask(void*) {
   uiStatic();
   if (!thermocouple.begin()) Serial.println(F("MAX31855 begin() GAGAL: cek wiring CS5, SO19, SCK18, VCC 3V3"));
 
-  uint32_t lastTemp = 0;
+  uint32_t lastTemp = 0, lastUi = 0;
+  uint8_t  pubCnt = SENSOR_PUBLISH_EVERY - 1;     // sampel pertama langsung dikirim
   bool first = true;
   for (;;) {
     uint32_t now = millis();
-    if (first || now - lastTemp >= 1000) {
+    if (first || now - lastTemp >= SENSOR_SAMPLE_MS) {
       first = false; lastTemp = now;
       gRaw = maxReadRaw();
       float tv = thermocouple.readCelsius();          // NAN kalau fault
-      gFault = isnan(tv) ? thermocouple.readError() : 0;
-      gTemp = tv;
-      if (!isnan(tv)) gLastValidMs = millis();
-      gTempMs = millis();
-      gTempSeq = gTempSeq + 1;
-      gTempFresh = true;
-      chartPush(tv);
-      chartDraw();
+      uint8_t f = isnan(tv) ? thermocouple.readError() : 0;
+      bool held, accepted;
+      float out = sensorFilterStep(tv, now, &held, &accepted);
+      gFault = f;
+      gTempRaw = tv;
+      gTempHeld = held;
+      gTemp = out;
+      if (accepted) gLastValidMs = now;
+      if (++pubCnt >= SENSOR_PUBLISH_EVERY) {        // 1 Hz: web, logger, grafik LCD
+        pubCnt = 0;
+        gTempMs = now;
+        gTempSeq = gTempSeq + 1;
+        gTempFresh = true;
+        chartPush(out);
+        chartDraw();
+      }
     }
-    uiUpdate();
-    vTaskDelay(pdMS_TO_TICKS(150));
+    if (now - lastUi >= 150) { lastUi = now; uiUpdate(); }   // laju LCD seperti sebelumnya
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 // ---------------- SETUP / LOOP ----------------
 void setup() {
-  // Motor DC dulu: EN LOW + PWM 0
+  // Motor DC PERTAMA: EN (GPIO14) LOW + PWM 0. Sebelum titik ini (bootloader) hanya
+  // pull-down 10k eksternal yang menahan EN/RPWM/LPWM.
   dcInit();
 
   // Servo: muat kalibrasi dari flash, langsung ke sudut TUTUP
