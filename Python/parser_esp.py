@@ -1,15 +1,17 @@
-"""Parser pesan WebSocket firmware rev 15 -> baris CSV (pesan rev 12-14 tetap terbaca).
+"""Parser pesan WebSocket firmware rev 16 -> baris CSV (pesan rev 12-15 tetap terbaca).
 
 Firmware mengirim 3 jenis pesan JSON:
-  temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms, st, te (rev 14), tr, held, ec (rev 15)
+  temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms, st, te (rev 14), tr, held, ec (rev 15),
+                pe, pu, se (rev 16: PID aktif, keluaran %, setpoint efektif)
                 t = suhu tersaring (SG + hold), tr = mentah
   st   (4 Hz) : ls[4], raw[4], vr[4], il[4], pn[4], bn, dx, xp, xm, en, sx, ax,
-                sa, sg, sr, sl, um, ux, cd, od, tc, dcc, dct, dcm, dcv, sp
+                sa, sg, sr, sl, um, ux, cd, od, tc, dcc, dct, dcm, dcv, sp,
+                kp, ki, kd, pm (rev 16; pm = Umax PID %, um = pulsa servo 0 derajat)
   msg         : text
 Urutan limit switch di array: 0 Z Atas, 1 Z Bawah, 2 X Awal, 3 X Akhir.
 
 Satu baris CSV = satu sampel suhu (pesan temp), digabung dengan status terakhir.
-Kolom yang BELUM dikirim firmware (PID, buzzer) tetap ada di header dan dibiarkan kosong.
+Kolom yang BELUM dikirim firmware (buzzer; PID pada firmware < rev 16) tetap ada di header, kosong.
 """
 import json
 import math
@@ -24,8 +26,8 @@ KOLOM = (
      # rev 14: status step test di firmware (0 siap, 1 berjalan, 2 selesai, 3 berhenti) + detik berjalan
      "step_test_status", "step_test_elapsed_s",
      "setpoint_c", "error_c",
-     # belum ada di firmware rev 12 -> kosong
-     "pid_output_pct", "kp", "ki", "kd",
+     # PID (rev 16): kosong bila firmware lama
+     "pid_aktif", "pid_output_pct", "setpoint_efektif_c", "kp", "ki", "kd", "pid_umax_pct",
      "servo_sudut_deg", "servo_target_deg", "servo_bukaan_pct", "servo_target_pct",
      "servo_pulsa_mentah_us", "servo_kunci", "servo_tutup_deg", "servo_buka_deg",
      "dc_out_pct", "dc_target_pct", "dc_duty_maks_pct", "dc_supply_v", "dc_v_rata",
@@ -150,6 +152,9 @@ class Penggabung:
         r["sensor_error_total"] = _bulat(m.get("ec"))
         r["step_test_status"] = _bulat(m.get("st"))
         r["step_test_elapsed_s"] = _bulat(m.get("te"))
+        r["pid_aktif"] = _bulat(m.get("pe"))
+        r["pid_output_pct"] = _angka(m.get("pu"))
+        r["setpoint_efektif_c"] = _angka(m.get("se"))     # null saat PID mati -> kosong
         r["setpoint_c"] = sp
         r["error_c"] = round(sp - suhu, 3) if (sp is not None and suhu is not None) else None
 
@@ -181,6 +186,10 @@ class Penggabung:
                 r["ls_%s_kena" % n] = None if kini is None else max(kini, self.ls_kena_interval[i])
                 r["ls_%s_raw" % n] = _bit(s.get("raw"), i)
             r["bench_mode"] = _angka(s.get("bn"))
+            r["kp"] = _angka(s.get("kp"))                     # nilai aktual dari firmware
+            r["ki"] = _angka(s.get("ki"))
+            r["kd"] = _angka(s.get("kd"))
+            r["pid_umax_pct"] = _angka(s.get("pm"))
             r["status_umur_ms"] = int(round((t_pc - self.status_t) * 1000))
             if r["setpoint_c"] is None:
                 r["setpoint_c"] = _angka(s.get("sp"))

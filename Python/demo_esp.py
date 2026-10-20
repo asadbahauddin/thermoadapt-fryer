@@ -1,6 +1,6 @@
 """Sumber data SIMULASI untuk mencoba logger tanpa hardware (python logger.py --demo).
 
-Mengirim pesan JSON dengan format PERSIS seperti firmware rev 15 (temp 1 Hz, st 4 Hz),
+Mengirim pesan JSON dengan format PERSIS seperti firmware rev 16 (temp 1 Hz, st 4 Hz),
 dari plant FOPDT sederhana (bukan model alat sebenarnya). Sengaja disisipkan kasus
 sulit: paket hilang, sensor error, pesan rusak, limit switch kena sesaat, pesan msg.
 """
@@ -29,7 +29,10 @@ class SumberDemo(threading.Thread):
     def run(self):
         self.log("[demo] sumber simulasi aktif (kecepatan %.1fx)" % self.k)
         rnd = random.Random(7)
-        T, Ta, K, tau, L = 30.0, 30.0, 2.2, 180.0, 12.0
+        T, Ta, K, tau, L = 30.0, 30.0, 4.0, 180.0, 12.0
+        # PID demo (meniru firmware rev 16, disederhanakan): aktif mulai t = 800 s
+        kp, ki, kd, umax, ramp = 1.9, 0.056, 0.0, 40.0, 0.15
+        pe, pu, se, I = 0, 0.0, None, 0.0
         cd, od = 0, 55
         hist_u = []
         seq = 0
@@ -41,7 +44,17 @@ class SumberDemo(threading.Thread):
             if self.berhenti.is_set():
                 return
             ts = k * 0.25
-            bukaan = 0 if ts < 10 else (60 if ts < 400 else (45 if ts < 800 else 55))
+            if ts >= 800 and not pe:                 # PID ON: bumpless dari bukaan terakhir
+                pe, se, I = 1, T, min(25.0, umax)
+                pu = I
+            if pe and k % 4 == 0:                    # 1 Hz
+                se = sp if abs(sp - se) <= ramp else se + (ramp if sp > se else -ramp)
+                e = se - T
+                uu = kp * e + I
+                pu = min(max(uu, 0.0), umax)
+                if not ((uu > umax and e > 0) or (uu < 0 and e < 0)):
+                    I = min(max(I + ki * e, 0.0), umax)
+            bukaan = pu if pe else (0 if ts < 10 else (30 if ts < 400 else 25))
             if ts >= 600:
                 sp = 170.0
             hist_u.append(bukaan)
@@ -54,7 +67,8 @@ class SumberDemo(threading.Thread):
                   "bn": 0, "dx": 0, "xp": int(ts * 10), "xm": 1, "en": 1, "sx": 3000, "ax": 3000,
                   "sa": round(sudut), "sg": round(sudut), "sr": 0, "sl": 0, "um": 500, "ux": 2500,
                   "cd": cd, "od": od, "tc": 180, "dcc": 25 if 200 <= ts < 205 else 0,
-                  "dct": 25 if 200 <= ts < 205 else 0, "dcm": 50, "dcv": 24, "sp": sp}
+                  "dct": 25 if 200 <= ts < 205 else 0, "dcm": 50, "dcv": 24, "sp": sp,
+                  "kp": kp, "ki": ki, "kd": kd, "pm": umax}
             self._kirim(st)
             if k % 4 == 0:
                 seq += 1
@@ -66,17 +80,17 @@ class SumberDemo(threading.Thread):
                     if seq < 302:
                         self._kirim({"type": "temp", "t": t_akhir, "ok": True, "raw": "00010001",
                                      "d": "FAULT: thermocouple LEPAS (open)", "up": int(ts), "sp": sp,
-                                     "seq": seq, "ms": ms, "st": 0, "te": 0, "tr": None, "held": 1, "ec": ec})
+                                     "seq": seq, "ms": ms, "st": 0, "te": 0, "tr": None, "held": 1, "ec": ec, "pe": pe, "pu": round(pu, 2), "se": None if se is None else round(se, 2)})
                     else:
                         self._kirim({"type": "temp", "t": None, "ok": False, "f": 1, "raw": "00010001",
                                      "d": "FAULT: thermocouple LEPAS (open)", "up": int(ts), "sp": sp,
-                                     "seq": seq, "ms": ms, "st": 0, "te": 0, "tr": None, "held": 0, "ec": ec})
+                                     "seq": seq, "ms": ms, "st": 0, "te": 0, "tr": None, "held": 0, "ec": ec, "pe": pe, "pu": round(pu, 2), "se": None if se is None else round(se, 2)})
                 else:
                     tr = round(T + rnd.gauss(0, 0.2), 2)
                     t_akhir = round(T, 2)             # pengganti nilai tersaring
                     self._kirim({"type": "temp", "t": t_akhir, "ok": True, "raw": "0A0C1234",
                                  "d": "frame valid", "up": int(ts), "sp": sp, "seq": seq, "ms": ms,
-                                 "st": 0, "te": 0, "tr": tr, "held": 0, "ec": ec})
+                                 "st": 0, "te": 0, "tr": tr, "held": 0, "ec": ec, "pe": pe, "pu": round(pu, 2), "se": None if se is None else round(se, 2)})
                 if seq == 100:
                     self._kirim("{rusak")
                 if seq == 200:

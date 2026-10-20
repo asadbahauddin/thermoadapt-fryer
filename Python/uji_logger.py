@@ -33,12 +33,18 @@ TEMP_LAMA = '{"type":"temp","t":150.00,"ok":true,"raw":"09600000","d":"frame val
 # rev 15 (snprintf broadcastTemp): nilai ditahan, mentah null
 TEMP_HELD = ('{"type":"temp","t":151.80,"ok":true,"raw":"00010001","d":"FAULT: thermocouple LEPAS (open)",'
              '"up":14,"sp":160.0,"seq":14,"ms":14034,"st":1,"te":42,"tr":null,"held":1,"ec":7}')
+# rev 16: PID aktif (snprintf broadcastTemp/broadcastStatus)
+TEMP_REV16 = ('{"type":"temp","t":148.20,"ok":true,"raw":"09840000","d":"frame valid","up":16,"sp":160.0,'
+              '"seq":16,"ms":16034,"st":0,"te":0,"tr":148.25,"held":0,"ec":7,"pe":1,"pu":23.45,"se":149.10}')
+TEMP_REV16_MATI = ('{"type":"temp","t":148.20,"ok":true,"raw":"09840000","d":"frame valid","up":17,"sp":160.0,'
+                   '"seq":17,"ms":17034,"st":0,"te":0,"tr":148.25,"held":0,"ec":7,"pe":0,"pu":0.00,"se":null}')
 TEMP_REV15 = ('{"type":"temp","t":152.10,"ok":true,"raw":"09840000","d":"frame valid",'
               '"up":15,"sp":160.0,"seq":15,"ms":15034,"st":1,"te":43,"tr":152.25,"held":0,"ec":7}')
 ST = ('{"type":"st","ls":[0,1,0,0],"raw":[1,0,1,1],"vr":[1,1,1,1],"il":[0,1,1,1],"pn":[35,17,34,39],'
       '"bn":0,"dx":1,"xp":-1200,"xm":0,"en":1,"sx":3000,"ax":3000,'
       '"sa":28,"sg":30,"sr":0,"sl":0,"um":500,"ux":2500,"cd":0,"od":55,"tc":180,'
       '"dcc":-50,"dct":-50,"dcm":50,"dcv":24,"sp":160.0}')
+ST_REV16 = ST.replace('"sp":160.0}', '"sp":160.0,"kp":1.900,"ki":0.05600,"kd":0.000,"pm":40.0}')
 
 
 class UjiParser(unittest.TestCase):
@@ -61,8 +67,8 @@ class UjiParser(unittest.TestCase):
         self.assertEqual([r["ls_zatas_kena"], r["ls_zbawah_kena"]], [0, 1])
         self.assertEqual([r["ls_zatas_raw"], r["ls_zbawah_raw"]], [1, 0])
         self.assertEqual(r["status_umur_ms"], 200)
-        for k in ("kp", "ki", "kd", "pid_output_pct", "buzzer_aktif"):
-            self.assertIsNone(r[k], k)                       # belum ada di firmware -> kosong
+        for k in ("kp", "ki", "kd", "pid_output_pct", "pid_aktif", "pid_umax_pct", "buzzer_aktif"):
+            self.assertIsNone(r[k], k)                       # pesan rev 12: belum ada -> kosong
 
     def test_sensor_error(self):
         g = Penggabung()
@@ -85,6 +91,17 @@ class UjiParser(unittest.TestCase):
         self.assertIsNone(r["suhu_mentah_c"])
         self.assertIsNone(r["suhu_ditahan"])
         self.assertIsNone(r["step_test_status"])
+
+    def test_rev16_pid(self):
+        g = Penggabung()
+        g.status_masuk(parse(ST_REV16), 0)
+        r = g.baris_dari_temp(parse(TEMP_REV16), 0.1, "x", 0)
+        self.assertEqual((r["pid_aktif"], r["pid_output_pct"], r["setpoint_efektif_c"]), (1, 23.45, 149.1))
+        self.assertEqual((r["kp"], r["ki"], r["kd"], r["pid_umax_pct"]), (1.9, 0.056, 0.0, 40.0))
+        self.assertEqual(r["servo_tutup_deg"], 0)                 # um/ux servo tidak tertukar dgn pm
+        r = g.baris_dari_temp(parse(TEMP_REV16_MATI), 1.1, "x", 1)
+        self.assertEqual(r["pid_aktif"], 0)
+        self.assertIsNone(r["setpoint_efektif_c"])                # se null -> kosong
 
     def test_firmware_lama_tanpa_sp(self):
         g = Penggabung()
@@ -203,7 +220,7 @@ class UjiEndToEnd(unittest.TestCase):
         try:
             here = os.path.dirname(os.path.abspath(__file__))
             p = subprocess.run([sys.executable, os.path.join(here, "logger.py"), "--demo",
-                                "--demo-kecepatan", "40", "--durasi", "420", "--tanpa-grafik",
+                                "--demo-kecepatan", "100", "--durasi", "1000", "--tanpa-grafik",
                                 "--folder", d, "--skenario", "uji e2e"],
                                capture_output=True, text=True, timeout=120)
             self.assertEqual(p.returncode, 0, p.stderr)
@@ -214,7 +231,7 @@ class UjiEndToEnd(unittest.TestCase):
             with open(csvs[0], encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.DictReader(f))
                 self.assertEqual(list(rows[0].keys()), KOLOM)
-            self.assertGreater(len(rows), 380)
+            self.assertGreater(len(rows), 950)
             self.assertEqual(rows[-1]["paket_hilang"], "2")
             err = [r for r in rows if r["sensor_ok"] == "0"]
             self.assertEqual(len(err), 1)                     # rev 15: 2 detik ditahan, lalu error
@@ -225,7 +242,12 @@ class UjiEndToEnd(unittest.TestCase):
             self.assertEqual(rows[-1]["sensor_error_total"], "15")
             self.assertTrue(any(r["ls_zatas_kena"] == "1" for r in rows))
             self.assertTrue(any("Limit Z kena" in r["pesan_esp"] for r in rows))
-            self.assertTrue(all(r["kp"] == "" for r in rows))
+            self.assertTrue(all(r["kp"] == "1.9" and r["pid_umax_pct"] == "40.0" for r in rows if r["n_status"]))
+            pid = [r for r in rows if r["pid_aktif"] == "1"]
+            self.assertGreater(len(pid), 0)                           # demo: PID mulai t = 800 s
+            self.assertTrue(all(r["setpoint_efektif_c"] != "" for r in pid))
+            self.assertTrue(all(0.0 <= float(r["pid_output_pct"]) <= 40.0 for r in pid))
+            self.assertTrue(all(r["setpoint_efektif_c"] == "" for r in rows if r["pid_aktif"] == "0"))
             self.assertIn("pesan rusak: 1", p.stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)

@@ -139,9 +139,12 @@ def main():
             if sekarang - t_gambar >= cfg.REFRESH_PLOT_S:
                 t_gambar = sekarang
                 if baris is not None:
-                    info = "%s | %d sampel | suhu %s °C | SP %s °C | servo %s %% | hilang %d" % (
+                    pid = ("PID %s %% (SPe %s)" % (ringkas(baris["pid_output_pct"]),
+                                                     ringkas(baris["setpoint_efektif_c"]))
+                           if baris.get("pid_aktif") == 1 else "PID mati")
+                    info = "%s | %d sampel | suhu %s °C | SP %s °C | servo %s %% | %s | hilang %d" % (
                         nama, pencatat.n, ringkas(baris["suhu_c"]), ringkas(baris["setpoint_c"]),
-                        ringkas(baris["servo_bukaan_pct"], "%.0f"), gab.paket_hilang)
+                        ringkas(baris["servo_bukaan_pct"], "%.0f"), pid, gab.paket_hilang)
                     grafik.set_judul(info)
                     grafik.gambar()
                     sys.stdout.write("\r" + info[len(nama) + 3:].replace(" °C", " C") + "   ")

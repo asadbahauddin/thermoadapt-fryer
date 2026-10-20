@@ -1,8 +1,27 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 15)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 16)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 16 (dari rev 15): PID SUHU (pertama, BELUM diuji di alat)
+ *   - Kontrol PID suhu -> bukaan katup (0..Umax persen dari rentang TUTUP..BUKA), update tiap
+ *     sampel suhu TERKIRIM (1 Hz, dari nilai tersaring rev 15; dt dari gTempMs). Web: kotak
+ *     "PID Suhu" (ON/OFF, Kp, Ki, Kd, Umax; disimpan di flash). Setpoint: "sp,<C>".
+ *     Bentuk: u = Kp*e + I + D, Ki dalam %/(C*dtk) (= Kp/Ti), D pada PENGUKURAN (terfilter).
+ *     Default dari step test web: Kp 1.9, Ti ~34 dtk (Ki 0.056), Kd 0. TEBAKAN AWAL, bukan optimum.
+ *   - Setpoint efektif naik bertahap (PID_SP_RAMP_C_S) mulai dari suhu saat PID dinyalakan.
+ *   - Anti-windup (integrasi bersyarat + batas), start tanpa loncatan (bumpless).
+ *   - Saat suhu DITAHAN (HELD, rev 15): integral & derivatif dibekukan, keluaran tetap.
+ *   - PENGAMAN: PID mati + katup TUTUP bila sensor error > SENSOR_FAULT_MS, tidak ada sampel
+ *     suhu baru > SENSOR_FAULT_MS (uiTask macet), suhu >= setpoint + PID_OVER_C atau
+ *     >= TEMP_CUTOFF_C - 5, tombol STOP, atau step test berjalan. Servo manual ditolak saat PID
+ *     aktif. Tutup (0 derajat) = api paling redup, BUKAN padam: PID tidak bisa mendinginkan.
+ *   - Setpoint dibatasi <= PID_SP_MAX_C (TEMP_CUTOFF_C - 15) selama PID aktif.
+ *   - JSON "temp" + pe (PID aktif), pu (keluaran %), se (setpoint efektif);
+ *     "st" + kp, ki, kd, pm (Umax %). ("um" TETAP pulsa servo 0 derajat; Umax sengaja "pm".)
+ *   - Perintah web > 63 karakter dibalas "terlalu panjang" (dulu dibuang diam-diam di 48).
+ *   - Harus ada orang di dekat mesin. Tidak ada E-stop fisik.
  *
  * REV 15 (dari rev 14):
  *   - BTS7960 sesuai wiring terbaru: GPIO27 = RPWM | GPIO26 = LPWM | GPIO14 = R_EN + L_EN
@@ -189,6 +208,17 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define SENSOR_HOLD_MS         3000UL   // tahan nilai tersaring terakhir maks selama ini saat error
 static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_FAULT_MS (pengaman sensor)");
 
+// ---- PID SUHU (rev 16) ----
+#define PID_DEFAULT_KP     1.9f      // %bukaan per C   (dari step test: PI konservatif)
+#define PID_DEFAULT_KI     0.056f    // %bukaan per (C*dtk) = Kp/Ti, Ti ~ 34 dtk
+#define PID_DEFAULT_KD     0.0f      // mulai 0: derivatif memperbesar noise sensor
+#define PID_DEFAULT_UMAX   40.0f     // batas atas bukaan (persen); naikkan bertahap bila perlu
+#define PID_SP_RAMP_C_S    0.15f     // laju maks perubahan setpoint efektif (C/dtk) = 9 C/menit
+                                     // (simulasi model dugaan: ramp 0.30 -> overshoot ~7 C, 0.15 -> ~4 C)
+#define PID_OVER_C         15.0f     // PID mati bila suhu >= setpoint + ini
+#define PID_SP_MAX_C       (TEMP_CUTOFF_C - 15.0f)
+#define PID_D_FILTER       0.8f      // filter derivatif orde-1 (0..1; makin besar makin halus)
+
 // ---- SETPOINT SUHU (rev 12) ----
 // Saat ini HANYA referensi untuk grafik web & logger; belum ada PID yang memakainya.
 #define DEFAULT_SETPOINT_C     160.0f
@@ -219,6 +249,20 @@ volatile float gSetpoint = DEFAULT_SETPOINT_C;
 volatile float gTempRaw = NAN;               // bacaan mentah MAX31855 terakhir (NAN bila fault)
 volatile bool  gTempHeld = false;            // true: gTemp = nilai ditahan (sensor error sesaat)
 volatile uint32_t gErrCount = 0;             // jumlah sampel tidak valid (fault/lonjakan) sejak boot
+volatile bool  pidOn = false;                // PID suhu aktif (rev 16)
+
+// Snapshot sampel TERKIRIM (1 Hz) untuk PID (rev 16). Ditulis uiTask (core 0), dibaca loop()
+// (core 1). volatile menjamin tiap nilai 32-bit utuh, tapi TIDAK menjamin suhu/waktu/flag
+// berasal dari sampel yang sama -> dibaca/ditulis bersama di dalam critical section.
+portMUX_TYPE gSnapMux = portMUX_INITIALIZER_UNLOCKED;
+struct TempSnap { float t; uint32_t ms; bool held; };
+TempSnap gPub = { NAN, 0, false };
+TempSnap readPubSnap() {
+  portENTER_CRITICAL(&gSnapMux);
+  TempSnap s = gPub;
+  portEXIT_CRITICAL(&gSnapMux);
+  return s;
+}
 
 // servo state
 int   svUsMin = DEFAULT_SERVO_US_MIN;
@@ -300,7 +344,26 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div style="margin-top:6px">Setpoint: <b id="spv">--</b> &deg;C &nbsp;
       <input id="spin" type="number" min="20" max="200" step="0.5">
       <button onclick="sendSp()">Set</button></div>
-    <small>Setpoint saat ini hanya REFERENSI grafik (firmware belum punya PID).</small>
+    <small>Setpoint dipakai PID (maks 165 &deg;C saat PID aktif) dan sebagai referensi grafik.</small>
+  </div>
+
+  <div class="box">
+    <h2>PID Suhu</h2>
+    <div class="pos"><span id="pids" class="err">PID mati</span>
+      <small>&nbsp; keluaran <b id="pidu">0.0</b>% &nbsp; setpoint efektif <b id="pide">--</b> &deg;C</small></div>
+    <button onclick="send('pid,1')" style="font-size:1.1em">PID ON</button>
+    <button onclick="send('pid,0')" style="font-size:1.1em">PID OFF</button>
+    <button class="stop" onclick="send('stop')" style="width:auto">STOP</button>
+    <div style="margin-top:8px">
+      Kp <input id="pkp" type="number" step="0.1" min="0" max="50">
+      Ki <input id="pki" type="number" step="0.001" min="0" max="5">
+      Kd <input id="pkd" type="number" step="0.1" min="0" max="200">
+      Umax <input id="pum" type="number" step="1" min="5" max="100"> %
+      <button onclick="pidSet()">Simpan</button></div>
+    <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
+    Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
+    PID mati otomatis + katup TUTUP bila: sensor error &gt;5 dtk, suhu &ge; setpoint+15 &deg;C, atau STOP.
+    TUTUP = api paling redup, bukan padam. Harus ada orang di dekat mesin.</small>
   </div>
 
   <div class="box">
@@ -406,6 +469,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function send(m){ if (sock && sock.readyState === 1) sock.send(m); else $('log').textContent='Belum terhubung'; }
   function setSA(ax){ send('spd,'+ax+','+$('spd'+ax).value); send('acc,'+ax+','+$('acc'+ax).value); }
   function toggleEn(){ send('en,' + (enState ? 0 : 1)); }
+  function pidSet(){
+    const k = ['pkp','pki','pkd','pum'].map(id => parseFloat($(id).value));
+    if (k.some(x => !isFinite(x))) { $('log').textContent = 'Parameter PID tidak valid'; return; }
+    // dibulatkan supaya perintah tidak melebihi panjang maksimum di firmware
+    send('pidk,' + k[0].toFixed(3) + ',' + k[1].toFixed(5) + ',' + k[2].toFixed(3) + ',' + k[3].toFixed(1));
+  }
   function sendSp(){
     const v = parseFloat($('spin').value);
     if (!isFinite(v) || v < 20 || v > 200) { $('log').textContent = 'Setpoint harus 20-200 C'; return; }
@@ -575,6 +644,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
       if (data.length > MAXPTS) data.shift();
       if (typeof m.st === 'number') stepFeed(m);
+      if (typeof m.pe === 'number') {
+        $('pids').textContent = m.pe ? 'PID AKTIF' : 'PID mati';
+        $('pids').className = m.pe ? 'ok' : 'err';
+        $('pidu').textContent = m.pu.toFixed(1);
+        $('pide').textContent = (m.pe && typeof m.se === 'number') ? m.se.toFixed(1) : '--';
+      }
       $('info').textContent = 'Uptime ' + m.up + ' s | MAX31855 raw ' + m.raw + ' | ' + m.d
         + (typeof m.ec === 'number' ? ' | error sensor: ' + m.ec : '')
         + (typeof m.tr === 'number' ? ' | mentah ' + m.tr.toFixed(2) + ' C' : (m.tr === null ? ' | mentah: -' : ''));
@@ -589,6 +664,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       $('enbtn').textContent = 'Driver X: ' + (m.en ? 'AKTIF (klik = matikan)' : 'MATI (klik = aktifkan)');
       setField('spdX', m.sx); setField('accX', m.ax);
       if (typeof m.sp === 'number') { $('spv').textContent = m.sp.toFixed(1); setField('spin', m.sp); }
+      // Umax memakai key "pm"; "um" tetap pulsa servo 0 derajat (kotak tersembunyi sumin)
+      if (typeof m.kp === 'number') { setField('pkp', m.kp); setField('pki', m.ki); setField('pkd', m.kd); setField('pum', m.pm); }
 
       // servo
       $('sva').textContent = m.sa; $('svg').textContent = m.sg;
@@ -897,6 +974,7 @@ void stepTestEnd(uint8_t newState, const char* why) {
 void stepTestStart(float angle, float maxC, int durMin) {
   float t = gTemp;
   if (stState == 1) { sendMsg("Step test sudah berjalan"); return; }
+  if (pidOn) { sendMsg("Step test ditolak: matikan PID dulu"); return; }
   if (isnan(t)) { sendMsg("Step test ditolak: sensor suhu tidak valid"); return; }
   if (svLock || svRawUs > 0) { sendMsg("Step test ditolak: servo terkunci/mode pulsa"); return; }
   if (!(angle > (float)svClosedDeg + 0.5f && angle <= (float)svOpenDeg)) {
@@ -923,6 +1001,105 @@ void stepTestUpdate() {
   if (isnan(t) && (now - gLastValidMs) > SENSOR_FAULT_MS) { stepTestEnd(3, "Step test BERHENTI: sensor suhu error"); return; }
   if (!isnan(t) && t >= stMaxC)                           { stepTestEnd(3, "Step test BERHENTI: suhu mencapai batas"); return; }
   if ((now - stStartMs) >= stDurMs)                       { stepTestEnd(2, "Step test SELESAI"); return; }
+}
+
+// ---------------- PID SUHU (rev 16) ----------------
+float pidKp = PID_DEFAULT_KP, pidKi = PID_DEFAULT_KI, pidKd = PID_DEFAULT_KD, pidUmax = PID_DEFAULT_UMAX;
+float pidI = 0;                   // suku integral (persen bukaan)
+float pidOut = 0;                 // keluaran terakhir (persen bukaan, 0..Umax)
+float pidSpEff = 0;               // setpoint efektif (dengan ramp)
+float pidPrevT = 0, pidDf = 0;    // untuk derivatif pada pengukuran
+bool  pidPrevValid = false;       // false setelah sampel NAN: derivatif diinisialisasi ulang
+uint32_t pidLastMs = 0;
+
+float servoOpeningPct() {         // bukaan servo sekarang (target) dalam persen TUTUP..BUKA
+  float span = (float)(svOpenDeg - svClosedDeg);
+  return span > 0 ? constrain(((float)svTargetDeg - (float)svClosedDeg) / span * 100.0f, 0.0f, 100.0f) : 0.0f;
+}
+
+void pidDisable(const char* why) {
+  bool was = pidOn;
+  pidOn = false; pidOut = 0; pidI = 0;
+  setServoAngle((float)svClosedDeg);         // katup ke TUTUP (api paling redup)
+  if (was && why) { sendMsg(why); buzzPlay(3); }
+}
+
+void pidEnable() {
+  TempSnap s = readPubSnap();
+  float t = s.t;
+  if (pidOn) { sendMsg("PID sudah aktif"); return; }
+  if (stState == 1)       { sendMsg("PID ditolak: step test berjalan"); return; }
+  if (isnan(t))           { sendMsg("PID ditolak: sensor suhu tidak valid"); return; }
+  if (s.held)             { sendMsg("PID ditolak: sensor sedang error sesaat (HELD)"); return; }
+  if (svLock || svRawUs > 0) { sendMsg("PID ditolak: servo terkunci/mode pulsa"); return; }
+  if (gSetpoint > PID_SP_MAX_C) {
+    char m[64]; snprintf(m, sizeof(m), "PID ditolak: setpoint maks %.0f C", PID_SP_MAX_C); sendMsg(m); return;
+  }
+  if (t >= gSetpoint + PID_OVER_C || t >= TEMP_CUTOFF_C - 5.0f) { sendMsg("PID ditolak: suhu sudah terlalu tinggi"); return; }
+  pidSpEff = t;                               // ramp dimulai dari suhu sekarang
+  pidPrevT = t; pidDf = 0; pidPrevValid = true;
+  pidI = constrain(servoOpeningPct(), 0.0f, pidUmax);   // start tanpa loncatan (e = 0 saat start)
+  pidOut = pidI;
+  pidLastMs = s.ms;
+  pidOn = true;
+  sendMsg("PID AKTIF");
+}
+
+// Dipanggil SEKALI per sampel suhu TERKIRIM (gTempFresh, 1 Hz). dt dari waktu sampel (gPub.ms).
+void pidUpdate() {
+  if (!pidOn) return;
+  TempSnap s = readPubSnap();
+  float T = s.t;
+  uint32_t nowMs = millis();
+  if (isnan(T)) {                             // sampel buruk: tahan keluaran; mati bila terlalu lama
+    pidPrevValid = false;
+    if (nowMs - gLastValidMs > SENSOR_FAULT_MS) pidDisable("PID MATI: sensor suhu error");
+    return;
+  }
+  if (T >= gSetpoint + PID_OVER_C || T >= TEMP_CUTOFF_C - 5.0f) { pidDisable("PID MATI: suhu melewati batas"); return; }
+  if (gSetpoint > PID_SP_MAX_C) { pidDisable("PID MATI: setpoint melewati batas"); return; }
+
+  float dt = (float)(s.ms - pidLastMs) / 1000.0f;
+  pidLastMs = s.ms;
+  if (dt < 0.05f || dt > 5.0f) dt = 1.0f;
+
+  // ramp setpoint efektif (tetap jalan saat HELD: hanya bergantung waktu)
+  float tgt = gSetpoint, stp = PID_SP_RAMP_C_S * dt;
+  if (fabsf(tgt - pidSpEff) <= stp) pidSpEff = tgt; else pidSpEff += (tgt > pidSpEff ? stp : -stp);
+
+  if (s.held) return;                         // nilai ditahan = bukan pengukuran baru: I & D beku, keluaran tetap
+
+  float e = pidSpEff - T;
+  if (!pidPrevValid) { pidPrevT = T; pidDf = 0; pidPrevValid = true; }   // cegah lonjakan D setelah gangguan
+  float dRaw = (T - pidPrevT) / dt; pidPrevT = T;
+  pidDf = PID_D_FILTER * pidDf + (1.0f - PID_D_FILTER) * dRaw;
+
+  float uUnsat = pidKp * e + pidI - pidKd * pidDf;
+  float u = constrain(uUnsat, 0.0f, pidUmax);
+  bool windup = (uUnsat > pidUmax && e > 0) || (uUnsat < 0.0f && e < 0);     // integrasi bersyarat
+  if (!windup) pidI = constrain(pidI + pidKi * e * dt, 0.0f, pidUmax);
+  pidOut = u;
+  setServoAngle((float)svClosedDeg + (float)(svOpenDeg - svClosedDeg) * u / 100.0f);
+}
+
+// Tiap loop: PID mati bila tidak ada sampel suhu terkirim > SENSOR_FAULT_MS (mis. uiTask/SPI macet).
+// Tanpa ini pidUpdate() tidak pernah dipanggil lagi dan katup tetap pada bukaan terakhir.
+void pidWatchdog() {
+  if (!pidOn) return;
+  TempSnap s = readPubSnap();
+  if (millis() - s.ms > SENSOR_FAULT_MS) pidDisable("PID MATI: data suhu berhenti (uiTask macet?)");
+}
+
+void pidSave() {
+  prefs.begin("fryer", false);
+  prefs.putFloat("pkp", pidKp); prefs.putFloat("pki", pidKi);
+  prefs.putFloat("pkd", pidKd); prefs.putFloat("pum", pidUmax);
+  prefs.end();
+}
+
+bool pidParamsOk(float kp, float ki, float kd, float um) {
+  return isfinite(kp) && isfinite(ki) && isfinite(kd) && isfinite(um) &&
+         kp >= 0 && kp <= 50 && ki >= 0 && ki <= 5 && kd >= 0 && kd <= 200 && um >= 5 && um <= 100;
 }
 
 // ---------------- PENGAMAN STEPPER X (tiap loop) ----------------
@@ -957,8 +1134,28 @@ void handleCommand(const char* cmd) {
   }
   if (strcmp(cmd, "stop") == 0) {
     hardStop(stepX); dcStop();
+    bool hadPid = pidOn;
+    if (hadPid) pidDisable("PID MATI (STOP): katup ke TUTUP");
     if (stState == 1) { stepTestEnd(3, "Step test DIBATALKAN (STOP)"); return; }
-    sendMsg("Semua gerak dihentikan"); return;
+    if (!hadPid) sendMsg("Semua gerak dihentikan");   // pesan PID tidak ditimpa
+    return;
+  }
+  // ---- PID (rev 16): "pid,<0|1>" dan "pidk,<kp>,<ki>,<kd>,<umax>" ----
+  if (sscanf(cmd, "pid,%d", &v) == 1) {
+    if (v) pidEnable(); else { if (pidOn) pidDisable("PID dimatikan, katup ke TUTUP"); else sendMsg("PID sudah mati"); }
+    return;
+  }
+  { float fk, fi, fd, fu;
+    if (sscanf(cmd, "pidk,%f,%f,%f,%f", &fk, &fi, &fd, &fu) == 4) {
+      if (!pidParamsOk(fk, fi, fd, fu)) {
+        sendMsg("Parameter PID ditolak: Kp 0-50, Ki 0-5, Kd 0-200, Umax 5-100"); return;
+      }
+      pidKp = fk; pidKi = fi; pidKd = fd; pidUmax = fu;
+      if (pidI > pidUmax) pidI = pidUmax;      // Ki disimpan dlm satuan keluaran: ganti Ki tanpa loncatan
+      pidSave();
+      sendMsg(pidOn ? "Parameter PID disimpan (berlaku sampel berikutnya)" : "Parameter PID disimpan");
+      return;
+    }
   }
   if (strcmp(cmd, "stx") == 0) {
     if (stState == 1) stepTestEnd(3, "Step test DIBATALKAN");
@@ -968,6 +1165,7 @@ void handleCommand(const char* cmd) {
   { float fa, fm; int dm;
     if (sscanf(cmd, "stt,%f,%f,%d", &fa, &fm, &dm) == 3) { stepTestStart(fa, fm, dm); return; } }
   if (stState == 1 && strncmp(cmd, "sv", 2) == 0) { sendMsg("Step test berjalan: servo dikunci (batal dulu)"); return; }
+  if (pidOn && strncmp(cmd, "sv", 2) == 0) { sendMsg("PID aktif: servo manual ditolak (PID OFF dulu)"); return; }
   if (sscanf(cmd, "en,%d", &v) == 1) {
     if (v == 0) hardStop(stepX);
     setDrivers(v != 0);
@@ -1018,6 +1216,11 @@ void handleCommand(const char* cmd) {
       snprintf(m, sizeof(m), "Setpoint ditolak: harus %.0f-%.0f C", SETPOINT_MIN_C, SETPOINT_MAX_C);
       sendMsg(m); return;
     }
+    if (pidOn && spv > PID_SP_MAX_C) {
+      char m[64];
+      snprintf(m, sizeof(m), "Setpoint ditolak: PID aktif, maks %.0f C", PID_SP_MAX_C);
+      sendMsg(m); return;
+    }
     gSetpoint = spv;
     prefs.begin("fryer", false);
     prefs.putFloat("sp", spv);
@@ -1033,12 +1236,12 @@ void handleCommand(const char* cmd) {
 }
 
 void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  if (type == WStype_TEXT && length > 0 && length < 48) {
-    char buf[48];
-    memcpy(buf, payload, length);
-    buf[length] = 0;
-    handleCommand(buf);
-  }
+  if (type != WStype_TEXT || length == 0) return;
+  if (length >= 64) { sendMsg("Perintah ditolak: terlalu panjang"); return; }   // dulu dibuang diam-diam
+  char buf[64];
+  memcpy(buf, payload, length);
+  buf[length] = 0;
+  handleCommand(buf);
 }
 
 // ---------------- BROADCAST ----------------
@@ -1053,32 +1256,40 @@ void broadcastStatus() {
   snprintf(b + n, sizeof(b) - n,
     "\"bn\":%d,\"dx\":%d,\"xp\":%ld,\"xm\":%d,\"en\":%d,\"sx\":%d,\"ax\":%d,"
     "\"sa\":%d,\"sg\":%d,\"sr\":%d,\"sl\":%d,\"um\":%d,\"ux\":%d,\"cd\":%d,\"od\":%d,\"tc\":%d,"
-    "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f}",
+    "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f,"
+    "\"kp\":%.3f,\"ki\":%.5f,\"kd\":%.3f,\"pm\":%.1f}",          // rev 16: pm = Umax PID (um = pulsa servo)
     (int)BENCH_MODE, digitalRead(PIN_X_DIR), stepX.currentPosition(), stepX.distanceToGo() != 0,
     driversEnabled, spdX, accX,
     (int)lroundf(svCurDeg), (int)lroundf(svTargetDeg), (int)svRawUs, (int)svLock, svUsMin, svUsMax, svClosedDeg, svOpenDeg, (int)TEMP_CUTOFF_C,
-    (int)lroundf(dcCur), (int)dcTarget, (int)(dcCap() * 100.0f + 0.5f), (int)MOTOR_SUPPLY_V, (float)gSetpoint);
+    (int)lroundf(dcCur), (int)dcTarget, (int)(dcCap() * 100.0f + 0.5f), (int)MOTOR_SUPPLY_V, (float)gSetpoint,
+    pidKp, pidKi, pidKd, pidUmax);
   ws.broadcastTXT(b);
 }
 
 void broadcastTemp() {
-  float t = gTemp;
+  // rev 16: t/ms/held dari snapshot terkirim yang SAMA dengan yang dipakai PID
+  TempSnap s = readPubSnap();
+  float t = s.t;
   uint32_t r = gRaw;
   const char* d = rawDiag(r);
   float sp = gSetpoint;
-  unsigned long seq = gTempSeq, ms = gTempMs;
+  unsigned long seq = gTempSeq, ms = s.ms;
   // rev 15: tr = mentah (null bila fault), held = nilai ditahan, ec = jumlah error sejak boot
   float tr = gTempRaw;
   char trs[16];
   if (isnan(tr)) strcpy(trs, "null"); else snprintf(trs, sizeof(trs), "%.2f", tr);
-  int held = gTempHeld ? 1 : 0;
+  int held = s.held ? 1 : 0;
   unsigned long ec = gErrCount;
-  char b[400];
+  // rev 16: pe = PID aktif, pu = keluaran PID (%), se = setpoint efektif (null bila PID mati)
+  bool pe = pidOn;
+  char ses[16];
+  if (pe) snprintf(ses, sizeof(ses), "%.2f", pidSpEff); else strcpy(ses, "null");
+  char b[480];
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec);
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec);
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses);
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses);
   ws.broadcastTXT(b);
 }
 
@@ -1315,6 +1526,9 @@ void uiTask(void*) {
       if (accepted) gLastValidMs = now;
       if (++pubCnt >= SENSOR_PUBLISH_EVERY) {        // 1 Hz: web, logger, grafik LCD
         pubCnt = 0;
+        portENTER_CRITICAL(&gSnapMux);               // rev 16: suhu+waktu+flag sampel yang sama
+        gPub.t = out; gPub.ms = now; gPub.held = held;
+        portEXIT_CRITICAL(&gSnapMux);
         gTempMs = now;
         gTempSeq = gTempSeq + 1;
         gTempFresh = true;
@@ -1340,7 +1554,10 @@ void setup() {
   svClosedDeg = prefs.getInt("cdeg",  DEFAULT_SERVO_CLOSED_DEG);
   svOpenDeg   = prefs.getInt("odeg",  DEFAULT_SERVO_OPEN_DEG);
   float spSaved = prefs.getFloat("sp", DEFAULT_SETPOINT_C);
+  float kp = prefs.getFloat("pkp", PID_DEFAULT_KP), ki = prefs.getFloat("pki", PID_DEFAULT_KI);
+  float kd = prefs.getFloat("pkd", PID_DEFAULT_KD), um = prefs.getFloat("pum", PID_DEFAULT_UMAX);
   prefs.end();
+  if (pidParamsOk(kp, ki, kd, um)) { pidKp = kp; pidKi = ki; pidKd = kd; pidUmax = um; }   // flash rusak -> default
   gSetpoint = (isfinite(spSaved) && spSaved >= SETPOINT_MIN_C && spSaved <= SETPOINT_MAX_C)
               ? spSaved : DEFAULT_SETPOINT_C;
   svClosedDeg = DEFAULT_SERVO_CLOSED_DEG;   // sudut tutup/buka dipaku (tidak diambil dari flash)
@@ -1390,7 +1607,8 @@ void loop() {
   dcUpdate();
   buzzerUpdate();
 
-  if (gTempFresh) { gTempFresh = false; broadcastTemp(); }
+  pidWatchdog();
+  if (gTempFresh) { gTempFresh = false; pidUpdate(); broadcastTemp(); }   // PID 1 Hz, dari nilai tersaring
 
   unsigned long now = millis();
   if (now - lastStatus >= 250) { lastStatus = now; broadcastStatus(); }
