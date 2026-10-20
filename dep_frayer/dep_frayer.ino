@@ -1,16 +1,33 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 12)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 11)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
  *
+ * REV 14 (dari rev 13):
+ *   - STEP TEST open-loop (tampil di web saja): servo dipindah ke satu bukaan tetap dari
+ *     TUTUP, suhu dicatat tiap 1 dtk oleh browser, lalu web menghitung kemiringan (R), dead
+ *     time (L) dan USULAN awal Kp/Ki/Kd (Ziegler-Nichols kurva reaksi, dan PI konservatif).
+ *     Perintah: "stt,<sudut>,<batasC>,<menit>" (mulai), "stx" (batal), tombol STOP juga membatalkan.
+ *     Pengaman: berhenti + katup ke TUTUP bila suhu >= batas, sensor error >5 dtk, batas waktu,
+ *     atau dibatalkan. Selama test, perintah servo manual ditolak. Ada api menyala TANPA PID:
+ *     harus ada orang di dekat mesin. Tidak ada E-stop fisik.
+ *   - Data hilang bila browser terputus/ditutup saat test (firmware tidak menyimpan sampel).
+ *
+ * REV 13 (dari rev 12):
+ *   - LIMIT SWITCH: penamaan dipetakan ulang (hasil pengujian fisik: Z Atas/Z Bawah dan
+ *     X Awal/X Akhir sebelumnya tertukar):
+ *       GPIO17 = Z Atas | GPIO35 = Z Bawah | GPIO39 = X Awal | GPIO34 = X Akhir
+ *     Perilaku pengaman tidak berubah (tiap pin tetap memblok arah yang sama): "naik" (+) memeriksa
+ *     switch Z Atas, "+" X memeriksa switch X Akhir. Semua interlock AKTIF.
+ *   - SERVO: hanya TUTUP (0) dan BUKA (55). Tombol TUTUP/BUKA, bukaan %, penyetelan halus.
+ *     Kalibrasi/simpan sudut/tes pulsa dihapus dari web. Sudut dikunci 0..55 di firmware
+ *     dan sudut tutup/buka dipaku (tidak diambil dari flash).
+ *
  * REV 12 (dari rev 11):
  *   - SETPOINT suhu: diatur dari web (perintah "sp,<C>", 20-200 C), disimpan di flash,
- *     digambar putus-putus (oranye) di grafik suhu web. BELUM ada PID: setpoint hanya
- *     referensi grafik & logger.
- *   - Pesan WebSocket "temp" ditambah: "sp" (setpoint), "seq" (nomor urut sampel suhu),
- *     "ms" (millis() saat sampel diambil). Pesan "st" ditambah "sp".
- *     Dipakai logger Python (folder Python/) untuk mendeteksi paket hilang.
+ *     digambar putus-putus (oranye) di grafik suhu web. BELUM ada PID.
+ *   - Pesan WebSocket "temp" ditambah "sp", "seq", "ms"; pesan "st" ditambah "sp".
  *
  * REV 11 (dari v10):
  *   - STEPPER Z DIHAPUS dari kode. Pin 26/27/14 sekarang milik BTS7960 (sesuai wiring-mu):
@@ -82,14 +99,14 @@ enum { LS_ZATAS = 0, LS_ZBAWAH, LS_XAWAL, LS_XAKHIR, LS_COUNT };
 
 struct LimitCfg { const char* name; uint8_t pin; bool activeHigh; bool verified; bool interlock; };
 LimitCfg LS[LS_COUNT] = {
-  // KOREKSI penamaan (hasil pengujian fisik): pin yang dulu diberi nama lain ternyata
-  //   GPIO35 = Z Atas | GPIO17 = Z Bawah | GPIO34 = X Awal | GPIO39 = X Akhir
-  // interlock = true: gerak berhenti saat limit di arah geraknya kena. Status sekarang: X Awal, X Akhir, Z Bawah = true;
-  // Z Atas = false sampai terbukti terbaca (tes tekan tangan, lalu "Naik 25%"). Setelah lulus, ubah jadi true.
-  { "Z Atas",  35, false, true, false },   // interlock Z OFF sementara (motor DC belum final)
-  { "Z Bawah", 17, false, true, true  },   // terbukti bekerja -> interlock ON
-  { "X Awal",  34, false, true, true  },
-  { "X Akhir", 39, false, true, true  },
+  // PEMETAAN (rev 13, hasil pengujian fisik): GPIO17 = Z Atas | GPIO35 = Z Bawah |
+  //                                           GPIO39 = X Awal | GPIO34 = X Akhir
+  // interlock = true: gerak berhenti saat limit di arah geraknya kena. Semua AKTIF.
+  // Jika satu switch ternyata tidak bereaksi/terbalik, set interlock false untuk pin itu.
+  { "Z Atas",  17, false, true, true },
+  { "Z Bawah", 35, false, true, true },
+  { "X Awal",  39, false, true, true },
+  { "X Akhir", 34, false, true, true },
 };
 
 // ---------------- KONFIGURASI ----------------
@@ -102,7 +119,7 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define BENCH_MODE             false   // false = interlock limit AKTIF (Z DC berhenti di Z Atas/Z Bawah; X jog tanpa limit terverifikasi dibatasi 200 step). true = meja uji tanpa pengaman
 #define EN_HIGH_MEANS_ENABLED  false   // TB6600 (X): GPIO LOW = driver AKTIF (hasil ukur)
 #define Z_PLUS_TOWARD_ATAS     true    // arah + Z (naik) menuju limit "atas"
-#define X_PLUS_TOWARD_AKHIR    false   // X Akhir kena => arah - diblok, arah + boleh
+#define X_PLUS_TOWARD_AKHIR    true    // arah + (KANAN) menuju switch GPIO34 ("X Akhir" setelah pemetaan ulang)
 #define X_DIR_INVERT           false
 
 #define MAX_JOG_STEPS        2000000000L
@@ -144,7 +161,7 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define TEMP_CUTOFF_C          180.0f   // NILAI AWAL: cek titik asap minyak
 
 // ---- SETPOINT SUHU (rev 12) ----
-// Saat ini HANYA referensi untuk grafik web & logger Python; belum ada PID yang memakainya.
+// Saat ini HANYA referensi untuk grafik web & logger; belum ada PID yang memakainya.
 #define DEFAULT_SETPOINT_C     160.0f
 #define SETPOINT_MIN_C          20.0f
 #define SETPOINT_MAX_C         200.0f
@@ -167,7 +184,7 @@ int  spdX = DEFAULT_SPEED_X, accX = DEFAULT_ACCEL_X;
 unsigned long lastStatus = 0;
 
 volatile uint32_t gRaw = 0;
-volatile uint32_t gTempSeq = 0;              // nomor urut sampel suhu (logger mendeteksi paket hilang)
+volatile uint32_t gTempSeq = 0;              // nomor urut sampel suhu (deteksi paket hilang)
 volatile uint32_t gTempMs  = 0;              // millis() saat sampel suhu diambil
 volatile float gSetpoint = DEFAULT_SETPOINT_C;
 
@@ -251,7 +268,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div style="margin-top:6px">Setpoint: <b id="spv">--</b> &deg;C &nbsp;
       <input id="spin" type="number" min="20" max="200" step="0.5">
       <button onclick="sendSp()">Set</button></div>
-    <small>Setpoint saat ini hanya REFERENSI grafik &amp; logger (firmware belum punya PID).</small>
+    <small>Setpoint saat ini hanya REFERENSI grafik (firmware belum punya PID).</small>
   </div>
 
   <div class="box">
@@ -259,38 +276,42 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="pos">Sudut: <span id="sva">0</span>&deg;
       <small>(target <span id="svg">0</span>&deg; | &asymp; <span id="svp">0</span>% bukaan <span id="svr"></span>)</small></div>
     <div id="svl" class="err" style="font-weight:700;min-height:18px"></div>
-    <input id="svs" type="range" min="0" max="180" value="0"
+    <input id="svs" type="range" min="0" max="55" value="0"
            oninput="$('svv').textContent=this.value" onchange="send('sva,'+this.value)">
-    <div>Slider: <span id="svv">0</span>&deg;</div>
-    <button onclick="send('sva,0')">0&deg;</button>
-    <button onclick="send('sva,45')">45&deg;</button>
-    <button onclick="send('sva,90')">90&deg;</button>
-    <button onclick="send('sva,135')">135&deg;</button>
-    <button onclick="send('sva,180')">180&deg;</button><br>
-    <button onclick="send('svad,-10')">-10</button>
-    <button onclick="send('svad,-5')">-5</button>
-    <button onclick="send('svad,-1')">-1</button>
-    <button onclick="send('svad,1')">+1</button>
-    <button onclick="send('svad,5')">+5</button>
-    <button onclick="send('svad,10')">+10</button><br>
-    <div style="margin-top:8px">Simpan sudut sekarang sebagai:
-      <button onclick="send('svset,c')">TUTUP</button>
-      <button onclick="send('svset,o')">BUKA</button><br>
-      <small>Tersimpan: tutup <b id="svcd">0</b>&deg;, buka <b id="svod">0</b>&deg;</small></div>
+    <div>Slider: <span id="svv">0</span>&deg; (0&deg; = TUTUP, 55&deg; = BUKA)</div>
+    <button onclick="send('sv,0')" style="font-size:1.2em">TUTUP (0&deg;)</button>
+    <button onclick="send('sv,100')" style="font-size:1.2em">BUKA (55&deg;)</button><br>
     <div style="margin-top:8px">Bukaan:
       <button onclick="send('sv,0')">0%</button>
       <button onclick="send('sv,25')">25%</button>
       <button onclick="send('sv,50')">50%</button>
       <button onclick="send('sv,75')">75%</button>
       <button onclick="send('sv,100')">100%</button></div>
-    <div style="margin-top:8px">Kalibrasi pulsa: 0&deg; = <input id="sumin" type="number" min="300" max="3000"> us,
-      180&deg; = <input id="sumax" type="number" min="300" max="3000"> us
-      <button onclick="send('svcal,'+$('sumin').value+','+$('sumax').value)">Simpan</button></div>
-    <div style="margin-top:8px">Tes pulsa mentah: <input id="sraw" type="number" value="1500" min="300" max="3000"> us
-      <button onclick="send('svus,'+$('sraw').value)">Kirim</button>
-      <button onclick="send('svus,0')">Kembali ke sudut</button></div>
-    <small>Mode kalibrasi: TANPA pembatas. Cari ujung jangkauan servo pelan-pelan dgn tes pulsa
-    mentah; pulsa di luar jangkauan membuat servo menekan stopper.</small>
+    <div style="margin-top:8px">Halus:
+      <button onclick="send('svad,-5')">-5</button>
+      <button onclick="send('svad,-1')">-1</button>
+      <button onclick="send('svad,1')">+1</button>
+      <button onclick="send('svad,5')">+5</button></div>
+    <small>Sudut dikunci 0&deg;..55&deg; (tutup..buka). Tidak ada kalibrasi lagi.</small>
+    <div style="display:none">
+      <b id="svcd"></b><b id="svod"></b>
+      <input id="sumin" type="number"><input id="sumax" type="number">
+    </div>
+  </div>
+
+  <div class="box">
+    <h2>Step Test (open-loop)</h2>
+    <div>Bukaan: <input id="stang" type="number" value="30" min="1" max="55" step="1"> &deg; (maks 55)
+      &nbsp; Batas suhu: <input id="stmax" type="number" value="170" min="60" max="175"> &deg;C
+      &nbsp; Durasi: <input id="stdur" type="number" value="20" min="1" max="60"> menit</div>
+    <button onclick="startStep()" style="font-size:1.1em">MULAI TEST</button>
+    <button class="stop" onclick="send('stx')" style="width:auto">BATAL</button>
+    <div id="sts" style="margin:6px 0">Siap.</div>
+    <canvas id="sc" width="640" height="200"></canvas>
+    <div id="sres" style="text-align:left;margin-top:6px;font-size:14px"></div>
+    <small>Mulai dari minyak DINGIN dan stabil. Katup dibuka ke bukaan tetap; suhu direkam tiap 1 dtk
+    oleh browser (jangan tutup/refresh halaman). Berhenti sendiri bila suhu mencapai batas atau waktu habis.
+    Api menyala TANPA PID: harus ada orang di dekat mesin. Hasil Kp/Ki/Kd hanya USULAN awal.</small>
   </div>
 
   <div class="box" id="dcbox">
@@ -357,6 +378,98 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const v = parseFloat($('spin').value);
     if (!isFinite(v) || v < 20 || v > 200) { $('log').textContent = 'Setpoint harus 20-200 C'; return; }
     send('sp,' + v.toFixed(1));
+  }
+
+  // ---------- STEP TEST: rekam, gambar, identifikasi ----------
+  let stPts = [], stRun = false, stFit = null;
+  const SC = $('sc'), sg = SC.getContext('2d');
+
+  function startStep(){
+    const a = parseFloat($('stang').value), mx = parseFloat($('stmax').value), du = parseInt($('stdur').value);
+    if (!isFinite(a) || !isFinite(mx) || !isFinite(du)) { $('log').textContent = 'Parameter step test tidak valid'; return; }
+    stPts = []; stFit = null; $('sres').innerHTML = '';
+    send('stt,' + a + ',' + mx + ',' + du);
+  }
+
+  function regress(p, i0, i1){            // regresi linear t -> T pada p[i0..i1-1]
+    let n = i1 - i0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    for (let i = i0; i < i1; i++) { const x = p[i][0], y = p[i][1]; sx += x; sy += y; sxx += x*x; sxy += x*y; syy += y*y; }
+    const den = n*sxx - sx*sx;
+    if (den === 0) return null;
+    const s = (n*sxy - sx*sy) / den, a = (sy - s*sx) / n;
+    const ssTot = syy - sy*sy/n;
+    let ssRes = 0; for (let i = i0; i < i1; i++) { const e = p[i][1] - (a + s*p[i][0]); ssRes += e*e; }
+    return {s: s, a: a, r2: ssTot > 0 ? 1 - ssRes/ssTot : 0};
+  }
+
+  function drawStep(){
+    sg.clearRect(0,0,SC.width,SC.height);
+    if (stPts.length < 2) return;
+    const tmax = Math.max(60, stPts[stPts.length-1][0]);
+    let lo = Infinity, hi = -Infinity;
+    stPts.forEach(p => { lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); });
+    if (hi - lo < 5) { const m=(hi+lo)/2; lo=m-2.5; hi=m+2.5; }
+    const X = t => 30 + t/tmax*(SC.width-40), Y = v => SC.height-14 - (v-lo)/(hi-lo)*(SC.height-28);
+    sg.strokeStyle='#4ade80'; sg.lineWidth=2; sg.beginPath();
+    stPts.forEach((p,i)=>{ if(i) sg.lineTo(X(p[0]),Y(p[1])); else sg.moveTo(X(p[0]),Y(p[1])); });
+    sg.stroke();
+    if (stFit){                              // garis singgung + garis dead time
+      sg.strokeStyle='#f59e0b'; sg.setLineDash([6,4]); sg.beginPath();
+      const t1 = Math.max(0, (lo - stFit.a)/stFit.s), t2 = Math.min(tmax, (hi - stFit.a)/stFit.s);
+      sg.moveTo(X(t1), Y(stFit.a + stFit.s*t1)); sg.lineTo(X(t2), Y(stFit.a + stFit.s*t2));
+      sg.stroke(); sg.setLineDash([]);
+    }
+    sg.fillStyle='#777'; sg.font='12px sans-serif';
+    sg.fillText(hi.toFixed(1)+' C',2,12); sg.fillText(lo.toFixed(1)+' C',2,SC.height-2);
+    sg.fillText(Math.round(tmax)+' s',SC.width-50,SC.height-2);
+  }
+
+  function analyzeStep(){
+    const p = stPts, n = p.length;
+    if (n < 30) { $('sres').textContent = 'Data terlalu sedikit (<30 detik): tidak bisa dianalisis.'; return; }
+    const W = Math.min(60, Math.floor(n/2));
+    let best = null;
+    for (let i = 0; i + W <= n; i++) {
+      const f = regress(p, i, i + W);
+      if (f && (best === null || f.s > best.s)) best = f;
+    }
+    if (!best || !(best.s > 0)) { $('sres').textContent = 'Suhu tidak naik: respons tidak valid (cek api/sensor).'; return; }
+    const k = Math.min(5, n);
+    let T0 = 0; for (let i = 0; i < k; i++) T0 += p[i][1]; T0 /= k;
+    const rise = p[n-1][1] - T0;
+    const L = (T0 - best.a) / best.s;                  // waktu garis singgung memotong T0 (dtk)
+    const ang = parseFloat($('stang').value), u = ang / 55 * 100;   // % bukaan (0..55 deg = 0..100%)
+    const Kp_ = best.s / u;                            // gain proses: degC/dtk per % bukaan
+    stFit = best; drawStep();
+    let h = '<b>Hasil identifikasi</b><br>'
+      + 'Kenaikan total: ' + rise.toFixed(1) + ' &deg;C dalam ' + p[n-1][0] + ' dtk (bukaan ' + ang + '&deg; = ' + u.toFixed(0) + '%)<br>'
+      + 'Kemiringan maks R = ' + (best.s*60).toFixed(2) + ' &deg;C/menit (R&sup2; ' + best.r2.toFixed(3) + ', jendela ' + W + ' dtk)<br>';
+    if (!(L > 0) || !isFinite(L)) {
+      h += '<span class="err">Dead time tidak valid (L=' + L.toFixed(1) + ' dtk): kemungkinan awal data tidak bersih/api sudah menyala sebelum test.</span>';
+      $('sres').innerHTML = h; return;
+    }
+    h += 'Dead time L = ' + L.toFixed(1) + ' dtk<br>';
+    const kZN = 1.2/(Kp_*L), tiZN = 2*L, tdZN = 0.5*L;
+    const kPI = 0.9/(Kp_*L), tiPI = 3.33*L;
+    h += '<br><b>Usulan awal (satuan: output % bukaan per &deg;C, waktu dtk)</b><br>'
+      + 'PI konservatif: Kp = ' + kPI.toFixed(2) + ', Ti = ' + tiPI.toFixed(0) + ' dtk, Ki = ' + (kPI/tiPI).toFixed(4) + '/dtk<br>'
+      + 'PID Z-N kurva reaksi: Kp = ' + kZN.toFixed(2) + ', Ti = ' + tiZN.toFixed(0) + ' dtk, Td = ' + tdZN.toFixed(0)
+      + ' dtk, Ki = ' + (kZN/tiZN).toFixed(4) + ', Kd = ' + (kZN*tdZN).toFixed(2) + '<br>'
+      + '<small>Peringatan: model integrator + dead time hanya berlaku di rentang suhu yang diuji; dead time mencakup '
+      + 'lag sensor/probe; Z-N agresif (overshoot), mulai dari PI konservatif. Ulangi test bila R&sup2; &lt; 0,98 atau hasil aneh.</small>';
+    $('sres').innerHTML = h;
+  }
+
+  function stepFeed(m){                    // dipanggil dari pesan 'temp'
+    const names = {0:'Siap.', 1:'BERJALAN', 2:'SELESAI', 3:'BERHENTI (pengaman/batal)'};
+    if (m.st === 1) {
+      if (!stRun) { stRun = true; if (stPts.length && stPts[stPts.length-1][0] > m.te) stPts = []; }
+      if (m.ok && m.t !== null && (stPts.length === 0 || m.te > stPts[stPts.length-1][0])) stPts.push([m.te, m.t]);
+      $('sts').textContent = 'BERJALAN: ' + m.te + ' dtk' + (m.t !== null ? ', suhu ' + m.t.toFixed(1) + ' C' : '');
+      drawStep();
+    } else {
+      if (stRun) { stRun = false; $('sts').textContent = names[m.st] || 'Selesai'; analyzeStep(); }
+    }
   }
 
   function card(ax, name){
@@ -427,6 +540,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         $('status').textContent='SENSOR ERROR: ' + ({1:'thermocouple LEPAS (open circuit)',2:'short ke GND',4:'short ke VCC'}[m.f] || 'tidak ada data (cek SCK/CS/SO & VCC 3V3)'); $('status').className='err'; data.push({t: null, sp: sp});
       }
       if (data.length > MAXPTS) data.shift();
+      if (typeof m.st === 'number') stepFeed(m);
       $('info').textContent = 'Uptime ' + m.up + ' s | MAX31855 raw ' + m.raw + ' | ' + m.d;
       draw();
     } else if (m.type === 'st'){
@@ -675,7 +789,7 @@ void servoSaveCal() {
 }
 
 void setServoAngle(float deg) {
-  deg = constrain(deg, 0.0f, 180.0f);
+  deg = constrain(deg, (float)svClosedDeg, (float)svOpenDeg);   // dikunci tutup..buka
   if (svLock && fabsf(deg - (float)svClosedDeg) > 0.5f) {
     sendMsg("Servo terkunci pengaman: hanya boleh ke sudut TUTUP"); return;
   }
@@ -728,6 +842,53 @@ void servoUpdate() {
   servoWriteUs(servoUsFromDeg(svCurDeg));
 }
 
+// ---------------- STEP TEST OPEN-LOOP (rev 14) ----------------
+// stState: 0 siap, 1 berjalan, 2 selesai normal, 3 dihentikan pengaman/batal
+#define ST_MAX_MIN       60
+volatile uint8_t stState = 0;
+float    stAngle = 30, stMaxC = 170;
+uint32_t stDurMs = 0, stStartMs = 0;
+
+uint32_t stElapsedS() { return (stState == 1) ? (millis() - stStartMs) / 1000UL : 0; }
+
+void stepTestEnd(uint8_t newState, const char* why) {
+  stState = newState;
+  setServoAngle((float)svClosedDeg);          // katup ke TUTUP
+  sendMsg(why);
+  buzzPlay(newState == 2 ? 2 : 3);
+}
+
+void stepTestStart(float angle, float maxC, int durMin) {
+  float t = gTemp;
+  if (stState == 1) { sendMsg("Step test sudah berjalan"); return; }
+  if (isnan(t)) { sendMsg("Step test ditolak: sensor suhu tidak valid"); return; }
+  if (svLock || svRawUs > 0) { sendMsg("Step test ditolak: servo terkunci/mode pulsa"); return; }
+  if (!(angle > (float)svClosedDeg + 0.5f && angle <= (float)svOpenDeg)) {
+    sendMsg("Step test ditolak: sudut harus di atas TUTUP dan maks BUKA"); return;
+  }
+  if (!(maxC >= 60.0f && maxC <= TEMP_CUTOFF_C - 5.0f)) {
+    char m[64]; snprintf(m, sizeof(m), "Step test ditolak: batas suhu 60-%.0f C", TEMP_CUTOFF_C - 5.0f);
+    sendMsg(m); return;
+  }
+  if (t >= maxC - 10.0f) { sendMsg("Step test ditolak: suhu awal terlalu dekat batas"); return; }
+  if (durMin < 1 || durMin > ST_MAX_MIN) { sendMsg("Step test ditolak: durasi 1-60 menit"); return; }
+  stAngle = angle; stMaxC = maxC;
+  stDurMs = (uint32_t)durMin * 60000UL;
+  stStartMs = millis();
+  stState = 1;
+  setServoAngle(angle);
+  sendMsg("Step test MULAI");
+}
+
+void stepTestUpdate() {
+  if (stState != 1) return;
+  uint32_t now = millis();
+  float t = gTemp;
+  if (isnan(t) && (now - gLastValidMs) > SENSOR_FAULT_MS) { stepTestEnd(3, "Step test BERHENTI: sensor suhu error"); return; }
+  if (!isnan(t) && t >= stMaxC)                           { stepTestEnd(3, "Step test BERHENTI: suhu mencapai batas"); return; }
+  if ((now - stStartMs) >= stDurMs)                       { stepTestEnd(2, "Step test SELESAI"); return; }
+}
+
 // ---------------- PENGAMAN STEPPER X (tiap loop) ----------------
 void enforceSafety() {
   long dx = stepX.distanceToGo();
@@ -758,7 +919,19 @@ void handleCommand(const char* cmd) {
     sendMsg(v ? "DIR X ditahan HIGH" : "DIR X ditahan LOW");
     return;
   }
-  if (strcmp(cmd, "stop") == 0) { hardStop(stepX); dcStop(); sendMsg("Semua gerak dihentikan"); return; }
+  if (strcmp(cmd, "stop") == 0) {
+    hardStop(stepX); dcStop();
+    if (stState == 1) { stepTestEnd(3, "Step test DIBATALKAN (STOP)"); return; }
+    sendMsg("Semua gerak dihentikan"); return;
+  }
+  if (strcmp(cmd, "stx") == 0) {
+    if (stState == 1) stepTestEnd(3, "Step test DIBATALKAN");
+    else sendMsg("Tidak ada step test berjalan");
+    return;
+  }
+  { float fa, fm; int dm;
+    if (sscanf(cmd, "stt,%f,%f,%d", &fa, &fm, &dm) == 3) { stepTestStart(fa, fm, dm); return; } }
+  if (stState == 1 && strncmp(cmd, "sv", 2) == 0) { sendMsg("Step test berjalan: servo dikunci (batal dulu)"); return; }
   if (sscanf(cmd, "en,%d", &v) == 1) {
     if (v == 0) hardStop(stepX);
     setDrivers(v != 0);
@@ -860,10 +1033,10 @@ void broadcastTemp() {
   unsigned long seq = gTempSeq, ms = gTempMs;
   char b[320];
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms);
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms);
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS());
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS());
   ws.broadcastTXT(b);
 }
 
@@ -1013,7 +1186,7 @@ void uiTask(void*) {
       gTemp = tv;
       if (!isnan(tv)) gLastValidMs = millis();
       gTempMs = millis();
-      gTempSeq++;
+      gTempSeq = gTempSeq + 1;
       gTempFresh = true;
       chartPush(tv);
       chartDraw();
@@ -1038,6 +1211,8 @@ void setup() {
   prefs.end();
   gSetpoint = (isfinite(spSaved) && spSaved >= SETPOINT_MIN_C && spSaved <= SETPOINT_MAX_C)
               ? spSaved : DEFAULT_SETPOINT_C;
+  svClosedDeg = DEFAULT_SERVO_CLOSED_DEG;   // sudut tutup/buka dipaku (tidak diambil dari flash)
+  svOpenDeg   = DEFAULT_SERVO_OPEN_DEG;
   svTargetDeg = svCurDeg = (float)svClosedDeg;
   servoPwmBegin();
   servoWriteUs(servoUsFromDeg(svCurDeg));
@@ -1078,6 +1253,7 @@ void loop() {
 
   enforceSafety();
   stepX.run();
+  stepTestUpdate();
   servoUpdate();
   dcUpdate();
   buzzerUpdate();
