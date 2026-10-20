@@ -1,8 +1,17 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 16)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 17)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 17 (dari rev 16): ADAPTIVE PID (BELUM diuji di alat)
+ *   - Hukum adaptasi sama dgn model Simulink: Kp = Kp0 + lambda_p|e|, Ki = Ki0 + lambda_i|e|,
+ *     Kd = Kd0 + lambda_d|dT/dt|, dibatasi PID_KP_MAX/KI_MAX/KD_MAX (dicek Ms, lihat konfigurasi).
+ *   - Web: ADAPTIF ON/OFF (OFF = PID biasa sbg pembanding), lambda, gain yang sedang dipakai.
+ *     Perintah "pida,<0|1>", "pidl,<lp>,<li>,<ld>"; disimpan di flash.
+ *   - JSON "temp" + kpe/kie/kde (gain DIPAKAI tiap sampel); "st" + ad, lp, li, ld.
+ *     kp/ki/kd di "st" = gain DASAR (Kp0/Ki0/Kd0).
+ *   - Tanpa deadband integral (sesuai keputusan pengguna).
  *
  * REV 16 (dari rev 15): PID SUHU (pertama, BELUM diuji di alat)
  *   - Kontrol PID suhu -> bukaan katup (0..Umax persen dari rentang TUTUP..BUKA), update tiap
@@ -219,6 +228,27 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 #define PID_SP_MAX_C       (TEMP_CUTOFF_C - 15.0f)
 #define PID_D_FILTER       0.8f      // filter derivatif orde-1 (0..1; makin besar makin halus)
 
+// ---- ADAPTIVE PID (rev 17), hukum adaptasi SAMA dgn model Simulink (build_deep_fryer_model.m) ----
+//   Kp(k) = min(Kp0 + lambda_p*|e(k)|,     max(Kp0, PID_KP_MAX))
+//   Ki(k) = min(Ki0 + lambda_i*|e(k)|,     max(Ki0, PID_KI_MAX))
+//   Kd(k) = min(Kd0 + lambda_d*|dT/dt|,    max(Kd0, PID_KD_MAX))   (dT/dt terfilter, C/dtk)
+// e = setpoint EFEKTIF - suhu. Adaptif OFF (atau semua lambda = 0) = PID biasa (pembanding).
+// Batas "max(K0, K_MAX)": adaptasi tidak pernah MENURUNKAN gain di bawah nilai dasar.
+// Integral disimpan dalam satuan keluaran (I += Ki(k)*e*dt), BUKAN Ki(k)*sum(e) seperti di
+// Simulink: perubahan Ki tidak menimbulkan loncatan keluaran (bentuk Simulink terbukti memicu
+// umpan balik positif, lihat catatan FIX #2 di model).
+// BATAS (dicek dgn Ms, model FOPDT dugaan K 1.9-4 C/%, tau 180-600 s, L 10-20 s, Ts 1 s):
+//   Kp 6 / Ki 0.2 -> Ms 2.6..125 (TIDAK aman). Kp 3 / Ki 0.065 / Kd 5 -> Ms tidak lebih buruk
+//   dari gain dasar (1.9/0.056). Ki paling cepat merusak kestabilan -> hampir tidak diadaptasi.
+//   Catatan: gain dasar sendiri Ms 2.9-3.8 bila dead time ternyata ~20 s -> verifikasi step test.
+#define PID_ADAPT_DEFAULT  true
+#define PID_DEFAULT_LP     0.06f     // %/(C*C):  Kp = 1.9 -> 3.0 pada |e| ~ 18 C
+#define PID_DEFAULT_LI     0.0005f   // %/(C*C*dtk)
+#define PID_DEFAULT_LD     5.0f      // Kd naik saat suhu berubah cepat (|dT/dt| 1 C/dtk -> +5)
+#define PID_KP_MAX         3.0f
+#define PID_KI_MAX         0.065f
+#define PID_KD_MAX         5.0f
+
 // ---- SETPOINT SUHU (rev 12) ----
 // Saat ini HANYA referensi untuk grafik web & logger; belum ada PID yang memakainya.
 #define DEFAULT_SETPOINT_C     160.0f
@@ -360,6 +390,17 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       Kd <input id="pkd" type="number" step="0.1" min="0" max="200">
       Umax <input id="pum" type="number" step="1" min="5" max="100"> %
       <button onclick="pidSet()">Simpan</button></div>
+    <div style="margin-top:8px">Mode: <b id="pada">--</b>
+      <button onclick="send('pida,1')">ADAPTIF ON</button>
+      <button onclick="send('pida,0')">ADAPTIF OFF (PID biasa)</button></div>
+    <div style="margin-top:6px">
+      &lambda;p <input id="plp" type="number" step="0.01" min="0" max="1">
+      &lambda;i <input id="pli" type="number" step="0.0001" min="0" max="0.01">
+      &lambda;d <input id="pld" type="number" step="0.5" min="0" max="50">
+      <button onclick="pidLam()">Simpan &lambda;</button></div>
+    <div style="margin-top:6px">Gain dipakai: Kp <b id="kpe">--</b> &nbsp; Ki <b id="kie">--</b> &nbsp; Kd <b id="kde">--</b></div>
+    <small>Adaptive PID: Kp = Kp0 + &lambda;p&middot;|e|, Ki = Ki0 + &lambda;i&middot;|e|, Kd = Kd0 + &lambda;d&middot;|dT/dt|,
+    dibatasi Kp &le; 3, Ki &le; 0,065, Kd &le; 5 (atau nilai dasar bila lebih besar). Kp/Ki/Kd di atas = nilai DASAR.</small><br>
     <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
     PID mati otomatis + katup TUTUP bila: sensor error &gt;5 dtk, suhu &ge; setpoint+15 &deg;C, atau STOP.
@@ -474,6 +515,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     if (k.some(x => !isFinite(x))) { $('log').textContent = 'Parameter PID tidak valid'; return; }
     // dibulatkan supaya perintah tidak melebihi panjang maksimum di firmware
     send('pidk,' + k[0].toFixed(3) + ',' + k[1].toFixed(5) + ',' + k[2].toFixed(3) + ',' + k[3].toFixed(1));
+  }
+  function pidLam(){
+    const l = ['plp','pli','pld'].map(id => parseFloat($(id).value));
+    if (l.some(x => !isFinite(x))) { $('log').textContent = 'Lambda tidak valid'; return; }
+    send('pidl,' + l[0].toFixed(4) + ',' + l[1].toFixed(5) + ',' + l[2].toFixed(3));
   }
   function sendSp(){
     const v = parseFloat($('spin').value);
@@ -650,6 +696,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         $('pidu').textContent = m.pu.toFixed(1);
         $('pide').textContent = (m.pe && typeof m.se === 'number') ? m.se.toFixed(1) : '--';
       }
+      if (typeof m.kpe === 'number') {
+        $('kpe').textContent = m.kpe.toFixed(3); $('kie').textContent = m.kie.toFixed(4); $('kde').textContent = m.kde.toFixed(3);
+      }
       $('info').textContent = 'Uptime ' + m.up + ' s | MAX31855 raw ' + m.raw + ' | ' + m.d
         + (typeof m.ec === 'number' ? ' | error sensor: ' + m.ec : '')
         + (typeof m.tr === 'number' ? ' | mentah ' + m.tr.toFixed(2) + ' C' : (m.tr === null ? ' | mentah: -' : ''));
@@ -666,6 +715,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (typeof m.sp === 'number') { $('spv').textContent = m.sp.toFixed(1); setField('spin', m.sp); }
       // Umax memakai key "pm"; "um" tetap pulsa servo 0 derajat (kotak tersembunyi sumin)
       if (typeof m.kp === 'number') { setField('pkp', m.kp); setField('pki', m.ki); setField('pkd', m.kd); setField('pum', m.pm); }
+      if (typeof m.ad === 'number') {
+        $('pada').textContent = m.ad ? 'ADAPTIVE PID' : 'PID BIASA'; $('pada').className = m.ad ? 'ok' : '';
+        setField('plp', m.lp); setField('pli', m.li); setField('pld', m.ld);
+      }
 
       // servo
       $('sva').textContent = m.sa; $('svg').textContent = m.sg;
@@ -1004,7 +1057,10 @@ void stepTestUpdate() {
 }
 
 // ---------------- PID SUHU (rev 16) ----------------
-float pidKp = PID_DEFAULT_KP, pidKi = PID_DEFAULT_KI, pidKd = PID_DEFAULT_KD, pidUmax = PID_DEFAULT_UMAX;
+float pidKp = PID_DEFAULT_KP, pidKi = PID_DEFAULT_KI, pidKd = PID_DEFAULT_KD, pidUmax = PID_DEFAULT_UMAX;  // gain DASAR (Kp0, Ki0, Kd0)
+bool  pidAdapt = PID_ADAPT_DEFAULT;                                       // rev 17: adaptif ON/OFF
+float pidLp = PID_DEFAULT_LP, pidLi = PID_DEFAULT_LI, pidLd = PID_DEFAULT_LD;   // lambda_p, lambda_i, lambda_d
+float pidKpEff = PID_DEFAULT_KP, pidKiEff = PID_DEFAULT_KI, pidKdEff = PID_DEFAULT_KD;  // gain yang SEDANG dipakai
 float pidI = 0;                   // suku integral (persen bukaan)
 float pidOut = 0;                 // keluaran terakhir (persen bukaan, 0..Umax)
 float pidSpEff = 0;               // setpoint efektif (dengan ramp)
@@ -1017,11 +1073,22 @@ float servoOpeningPct() {         // bukaan servo sekarang (target) dalam persen
   return span > 0 ? constrain(((float)svTargetDeg - (float)svClosedDeg) / span * 100.0f, 0.0f, 100.0f) : 0.0f;
 }
 
+void pidAdaptGains(float e, float dTdt);   // didefinisikan di bawah
+
 void pidDisable(const char* why) {
   bool was = pidOn;
   pidOn = false; pidOut = 0; pidI = 0;
+  pidAdaptGains(0.0f, 0.0f);                 // rev 17: gain dipakai kembali = gain dasar
   setServoAngle((float)svClosedDeg);         // katup ke TUTUP (api paling redup)
   if (was && why) { sendMsg(why); buzzPlay(3); }
+}
+
+// rev 17: hukum adaptasi (lihat blok ADAPTIVE PID di konfigurasi). Adaptif OFF -> gain dasar.
+void pidAdaptGains(float e, float dTdt) {
+  if (!pidAdapt) { pidKpEff = pidKp; pidKiEff = pidKi; pidKdEff = pidKd; return; }
+  pidKpEff = fminf(pidKp + pidLp * fabsf(e),    fmaxf(pidKp, PID_KP_MAX));
+  pidKiEff = fminf(pidKi + pidLi * fabsf(e),    fmaxf(pidKi, PID_KI_MAX));
+  pidKdEff = fminf(pidKd + pidLd * fabsf(dTdt), fmaxf(pidKd, PID_KD_MAX));
 }
 
 void pidEnable() {
@@ -1038,6 +1105,7 @@ void pidEnable() {
   if (t >= gSetpoint + PID_OVER_C || t >= TEMP_CUTOFF_C - 5.0f) { sendMsg("PID ditolak: suhu sudah terlalu tinggi"); return; }
   pidSpEff = t;                               // ramp dimulai dari suhu sekarang
   pidPrevT = t; pidDf = 0; pidPrevValid = true;
+  pidAdaptGains(0.0f, 0.0f);                  // gain efektif = gain dasar saat start
   pidI = constrain(servoOpeningPct(), 0.0f, pidUmax);   // start tanpa loncatan (e = 0 saat start)
   pidOut = pidI;
   pidLastMs = s.ms;
@@ -1074,10 +1142,11 @@ void pidUpdate() {
   float dRaw = (T - pidPrevT) / dt; pidPrevT = T;
   pidDf = PID_D_FILTER * pidDf + (1.0f - PID_D_FILTER) * dRaw;
 
-  float uUnsat = pidKp * e + pidI - pidKd * pidDf;
+  pidAdaptGains(e, pidDf);                    // rev 17: Kp/Ki/Kd efektif dari |e| dan |dT/dt|
+  float uUnsat = pidKpEff * e + pidI - pidKdEff * pidDf;
   float u = constrain(uUnsat, 0.0f, pidUmax);
   bool windup = (uUnsat > pidUmax && e > 0) || (uUnsat < 0.0f && e < 0);     // integrasi bersyarat
-  if (!windup) pidI = constrain(pidI + pidKi * e * dt, 0.0f, pidUmax);
+  if (!windup) pidI = constrain(pidI + pidKiEff * e * dt, 0.0f, pidUmax);
   pidOut = u;
   setServoAngle((float)svClosedDeg + (float)(svOpenDeg - svClosedDeg) * u / 100.0f);
 }
@@ -1094,12 +1163,19 @@ void pidSave() {
   prefs.begin("fryer", false);
   prefs.putFloat("pkp", pidKp); prefs.putFloat("pki", pidKi);
   prefs.putFloat("pkd", pidKd); prefs.putFloat("pum", pidUmax);
+  prefs.putFloat("plp", pidLp); prefs.putFloat("pli", pidLi); prefs.putFloat("pld", pidLd);
+  prefs.putBool("pad", pidAdapt);
   prefs.end();
 }
 
 bool pidParamsOk(float kp, float ki, float kd, float um) {
   return isfinite(kp) && isfinite(ki) && isfinite(kd) && isfinite(um) &&
          kp >= 0 && kp <= 50 && ki >= 0 && ki <= 5 && kd >= 0 && kd <= 200 && um >= 5 && um <= 100;
+}
+
+bool pidLambdaOk(float lp, float li, float ld) {
+  return isfinite(lp) && isfinite(li) && isfinite(ld) &&
+         lp >= 0 && lp <= 1 && li >= 0 && li <= 0.01f && ld >= 0 && ld <= 50;
 }
 
 // ---------------- PENGAMAN STEPPER X (tiap loop) ----------------
@@ -1140,17 +1216,34 @@ void handleCommand(const char* cmd) {
     if (!hadPid) sendMsg("Semua gerak dihentikan");   // pesan PID tidak ditimpa
     return;
   }
+  // ---- rev 17: "pida,<0|1>" adaptif ON/OFF (OFF = PID biasa, untuk pembanding) ----
+  if (sscanf(cmd, "pida,%d", &v) == 1) {
+    pidAdapt = (v != 0);
+    if (!pidOn) pidAdaptGains(0.0f, 0.0f);   // saat aktif: berlaku di sampel berikutnya
+    pidSave();
+    sendMsg(pidAdapt ? "Mode ADAPTIVE PID" : "Mode PID BIASA (adaptif OFF)");
+    return;
+  }
   // ---- PID (rev 16): "pid,<0|1>" dan "pidk,<kp>,<ki>,<kd>,<umax>" ----
   if (sscanf(cmd, "pid,%d", &v) == 1) {
     if (v) pidEnable(); else { if (pidOn) pidDisable("PID dimatikan, katup ke TUTUP"); else sendMsg("PID sudah mati"); }
     return;
   }
   { float fk, fi, fd, fu;
+    // rev 17: "pidl,<lambda_p>,<lambda_i>,<lambda_d>"
+    if (sscanf(cmd, "pidl,%f,%f,%f", &fk, &fi, &fd) == 3) {
+      if (!pidLambdaOk(fk, fi, fd)) { sendMsg("Lambda ditolak: lp 0-1, li 0-0.01, ld 0-50"); return; }
+      pidLp = fk; pidLi = fi; pidLd = fd;
+      pidSave();
+      sendMsg("Lambda adaptif disimpan");
+      return;
+    }
     if (sscanf(cmd, "pidk,%f,%f,%f,%f", &fk, &fi, &fd, &fu) == 4) {
       if (!pidParamsOk(fk, fi, fd, fu)) {
         sendMsg("Parameter PID ditolak: Kp 0-50, Ki 0-5, Kd 0-200, Umax 5-100"); return;
       }
       pidKp = fk; pidKi = fi; pidKd = fd; pidUmax = fu;
+      if (!pidOn) pidAdaptGains(0.0f, 0.0f);
       if (pidI > pidUmax) pidI = pidUmax;      // Ki disimpan dlm satuan keluaran: ganti Ki tanpa loncatan
       pidSave();
       sendMsg(pidOn ? "Parameter PID disimpan (berlaku sampel berikutnya)" : "Parameter PID disimpan");
@@ -1257,12 +1350,14 @@ void broadcastStatus() {
     "\"bn\":%d,\"dx\":%d,\"xp\":%ld,\"xm\":%d,\"en\":%d,\"sx\":%d,\"ax\":%d,"
     "\"sa\":%d,\"sg\":%d,\"sr\":%d,\"sl\":%d,\"um\":%d,\"ux\":%d,\"cd\":%d,\"od\":%d,\"tc\":%d,"
     "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f,"
-    "\"kp\":%.3f,\"ki\":%.5f,\"kd\":%.3f,\"pm\":%.1f}",          // rev 16: pm = Umax PID (um = pulsa servo)
+    "\"kp\":%.3f,\"ki\":%.5f,\"kd\":%.3f,\"pm\":%.1f,"           // rev 16: pm = Umax PID (um = pulsa servo); kp/ki/kd = gain DASAR
+    "\"ad\":%d,\"lp\":%.4f,\"li\":%.5f,\"ld\":%.3f}",            // rev 17: adaptif ON/OFF + lambda
     (int)BENCH_MODE, digitalRead(PIN_X_DIR), stepX.currentPosition(), stepX.distanceToGo() != 0,
     driversEnabled, spdX, accX,
     (int)lroundf(svCurDeg), (int)lroundf(svTargetDeg), (int)svRawUs, (int)svLock, svUsMin, svUsMax, svClosedDeg, svOpenDeg, (int)TEMP_CUTOFF_C,
     (int)lroundf(dcCur), (int)dcTarget, (int)(dcCap() * 100.0f + 0.5f), (int)MOTOR_SUPPLY_V, (float)gSetpoint,
-    pidKp, pidKi, pidKd, pidUmax);
+    pidKp, pidKi, pidKd, pidUmax,
+    (int)pidAdapt, pidLp, pidLi, pidLd);
   ws.broadcastTXT(b);
 }
 
@@ -1281,15 +1376,16 @@ void broadcastTemp() {
   int held = s.held ? 1 : 0;
   unsigned long ec = gErrCount;
   // rev 16: pe = PID aktif, pu = keluaran PID (%), se = setpoint efektif (null bila PID mati)
+  // rev 17: kpe/kie/kde = gain yang SEDANG dipakai (adaptif); saat PID mati = gain dasar
   bool pe = pidOn;
   char ses[16];
   if (pe) snprintf(ses, sizeof(ses), "%.2f", pidSpEff); else strcpy(ses, "null");
-  char b[480];
+  char b[560];
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses);
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses);
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff);
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff);
   ws.broadcastTXT(b);
 }
 
@@ -1556,8 +1652,14 @@ void setup() {
   float spSaved = prefs.getFloat("sp", DEFAULT_SETPOINT_C);
   float kp = prefs.getFloat("pkp", PID_DEFAULT_KP), ki = prefs.getFloat("pki", PID_DEFAULT_KI);
   float kd = prefs.getFloat("pkd", PID_DEFAULT_KD), um = prefs.getFloat("pum", PID_DEFAULT_UMAX);
+  float lp = prefs.getFloat("plp", PID_DEFAULT_LP), li = prefs.getFloat("pli", PID_DEFAULT_LI);
+  float ld = prefs.getFloat("pld", PID_DEFAULT_LD);
+  bool  pad = prefs.getBool("pad", PID_ADAPT_DEFAULT);
   prefs.end();
   if (pidParamsOk(kp, ki, kd, um)) { pidKp = kp; pidKi = ki; pidKd = kd; pidUmax = um; }   // flash rusak -> default
+  if (pidLambdaOk(lp, li, ld)) { pidLp = lp; pidLi = li; pidLd = ld; }
+  pidAdapt = pad;
+  pidAdaptGains(0.0f, 0.0f);
   gSetpoint = (isfinite(spSaved) && spSaved >= SETPOINT_MIN_C && spSaved <= SETPOINT_MAX_C)
               ? spSaved : DEFAULT_SETPOINT_C;
   svClosedDeg = DEFAULT_SERVO_CLOSED_DEG;   // sudut tutup/buka dipaku (tidak diambil dari flash)

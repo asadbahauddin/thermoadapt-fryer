@@ -35,7 +35,9 @@ python Python/uji_logger.py        # uji otomatis (parser, WebSocket, end-to-end
 Berhenti dengan menutup jendela grafik atau Ctrl+C. CSV (ditulis tiap sampel, aman bila
 crash) dan PNG seluruh pengujian tersimpan di `Python/data/deepfryer_<tanggal>_<jam>.*`.
 Satu baris per sampel suhu (1 Hz); waktu memakai jam ESP32 (`ms`) sehingga bebas jitter WiFi.
-Kolom PID (firmware rev 16): `pid_aktif`, `pid_output_pct`, `setpoint_efektif_c`, `kp`, `ki`, `kd`,
+Kolom PID (firmware rev 16-17): `pid_aktif`, `pid_output_pct`, `setpoint_efektif_c`, `kp`, `ki`, `kd`
+(gain yang SEDANG dipakai, berubah tiap detik saat Adaptive PID), `kp0`/`ki0`/`kd0` (gain dasar),
+`pid_adaptif`, `lambda_p`/`lambda_i`/`lambda_d`,
 `pid_umax_pct`. Grafik live: suhu vs setpoint vs setpoint efektif, dan sudut servo vs keluaran PID.
 `suhu_c` adalah suhu tersaring firmware (tolak lonjakan + hold + Savitzky-Golay kausal);
 `suhu_mentah_c`, `suhu_ditahan`, `sensor_error_total` mencatat bacaan mentah dan kondisi sensor.

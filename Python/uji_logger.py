@@ -45,6 +45,9 @@ ST = ('{"type":"st","ls":[0,1,0,0],"raw":[1,0,1,1],"vr":[1,1,1,1],"il":[0,1,1,1]
       '"sa":28,"sg":30,"sr":0,"sl":0,"um":500,"ux":2500,"cd":0,"od":55,"tc":180,'
       '"dcc":-50,"dct":-50,"dcm":50,"dcv":24,"sp":160.0}')
 ST_REV16 = ST.replace('"sp":160.0}', '"sp":160.0,"kp":1.900,"ki":0.05600,"kd":0.000,"pm":40.0}')
+ST_REV17 = ST.replace('"sp":160.0}', '"sp":160.0,"kp":1.900,"ki":0.05600,"kd":0.000,"pm":40.0,'
+                      '"ad":1,"lp":0.0600,"li":0.00050,"ld":5.000}')
+TEMP_REV17 = TEMP_REV16.replace('"se":149.10}', '"se":149.10,"kpe":1.9540,"kie":0.05645,"kde":0.2500}')
 
 
 class UjiParser(unittest.TestCase):
@@ -102,6 +105,14 @@ class UjiParser(unittest.TestCase):
         r = g.baris_dari_temp(parse(TEMP_REV16_MATI), 1.1, "x", 1)
         self.assertEqual(r["pid_aktif"], 0)
         self.assertIsNone(r["setpoint_efektif_c"])                # se null -> kosong
+
+    def test_rev17_adaptif(self):
+        g = Penggabung()
+        g.status_masuk(parse(ST_REV17), 0)
+        r = g.baris_dari_temp(parse(TEMP_REV17), 0.1, "x", 0)
+        self.assertEqual((r["kp"], r["ki"], r["kd"]), (1.954, 0.05645, 0.25))       # gain DIPAKAI
+        self.assertEqual((r["kp0"], r["ki0"], r["kd0"]), (1.9, 0.056, 0.0))         # gain dasar
+        self.assertEqual((r["pid_adaptif"], r["lambda_p"], r["lambda_i"], r["lambda_d"]), (1, 0.06, 0.0005, 5.0))
 
     def test_firmware_lama_tanpa_sp(self):
         g = Penggabung()
@@ -242,7 +253,9 @@ class UjiEndToEnd(unittest.TestCase):
             self.assertEqual(rows[-1]["sensor_error_total"], "15")
             self.assertTrue(any(r["ls_zatas_kena"] == "1" for r in rows))
             self.assertTrue(any("Limit Z kena" in r["pesan_esp"] for r in rows))
-            self.assertTrue(all(r["kp"] == "1.9" and r["pid_umax_pct"] == "40.0" for r in rows if r["n_status"]))
+            self.assertTrue(all(r["kp0"] == "1.9" and r["pid_umax_pct"] == "40.0" for r in rows if r["n_status"]))
+            self.assertTrue(all(r["pid_adaptif"] == "1" and r["lambda_p"] == "0.06" for r in rows if r["n_status"]))
+            self.assertTrue(all(1.9 <= float(r["kp"]) <= 3.0 for r in rows if r["kp"]))   # adaptif, dibatasi
             pid = [r for r in rows if r["pid_aktif"] == "1"]
             self.assertGreater(len(pid), 0)                           # demo: PID mulai t = 800 s
             self.assertTrue(all(r["setpoint_efektif_c"] != "" for r in pid))

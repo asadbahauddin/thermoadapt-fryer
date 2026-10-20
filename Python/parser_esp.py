@@ -1,12 +1,14 @@
-"""Parser pesan WebSocket firmware rev 16 -> baris CSV (pesan rev 12-15 tetap terbaca).
+"""Parser pesan WebSocket firmware rev 17 -> baris CSV (pesan rev 12-16 tetap terbaca).
 
 Firmware mengirim 3 jenis pesan JSON:
   temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms, st, te (rev 14), tr, held, ec (rev 15),
-                pe, pu, se (rev 16: PID aktif, keluaran %, setpoint efektif)
+                pe, pu, se (rev 16: PID aktif, keluaran %, setpoint efektif),
+                kpe, kie, kde (rev 17: gain yang SEDANG dipakai, adaptif)
                 t = suhu tersaring (SG + hold), tr = mentah
   st   (4 Hz) : ls[4], raw[4], vr[4], il[4], pn[4], bn, dx, xp, xm, en, sx, ax,
                 sa, sg, sr, sl, um, ux, cd, od, tc, dcc, dct, dcm, dcv, sp,
-                kp, ki, kd, pm (rev 16; pm = Umax PID %, um = pulsa servo 0 derajat)
+                kp, ki, kd, pm (rev 16; pm = Umax PID %, um = pulsa servo 0 derajat),
+                ad, lp, li, ld (rev 17: adaptif ON/OFF, lambda). kp/ki/kd di 'st' = gain DASAR.
   msg         : text
 Urutan limit switch di array: 0 Z Atas, 1 Z Bawah, 2 X Awal, 3 X Akhir.
 
@@ -27,7 +29,9 @@ KOLOM = (
      "step_test_status", "step_test_elapsed_s",
      "setpoint_c", "error_c",
      # PID (rev 16): kosong bila firmware lama
+     # kp/ki/kd = gain yang SEDANG dipakai (berubah tiap sampel saat adaptif); kp0.. = gain dasar
      "pid_aktif", "pid_output_pct", "setpoint_efektif_c", "kp", "ki", "kd", "pid_umax_pct",
+     "pid_adaptif", "kp0", "ki0", "kd0", "lambda_p", "lambda_i", "lambda_d",
      "servo_sudut_deg", "servo_target_deg", "servo_bukaan_pct", "servo_target_pct",
      "servo_pulsa_mentah_us", "servo_kunci", "servo_tutup_deg", "servo_buka_deg",
      "dc_out_pct", "dc_target_pct", "dc_duty_maks_pct", "dc_supply_v", "dc_v_rata",
@@ -155,6 +159,9 @@ class Penggabung:
         r["pid_aktif"] = _bulat(m.get("pe"))
         r["pid_output_pct"] = _angka(m.get("pu"))
         r["setpoint_efektif_c"] = _angka(m.get("se"))     # null saat PID mati -> kosong
+        r["kp"] = _angka(m.get("kpe"))                    # rev 17: gain yang dipakai sampel ini
+        r["ki"] = _angka(m.get("kie"))
+        r["kd"] = _angka(m.get("kde"))
         r["setpoint_c"] = sp
         r["error_c"] = round(sp - suhu, 3) if (sp is not None and suhu is not None) else None
 
@@ -186,9 +193,15 @@ class Penggabung:
                 r["ls_%s_kena" % n] = None if kini is None else max(kini, self.ls_kena_interval[i])
                 r["ls_%s_raw" % n] = _bit(s.get("raw"), i)
             r["bench_mode"] = _angka(s.get("bn"))
-            r["kp"] = _angka(s.get("kp"))                     # nilai aktual dari firmware
-            r["ki"] = _angka(s.get("ki"))
-            r["kd"] = _angka(s.get("kd"))
+            r["kp0"] = _angka(s.get("kp"))                    # gain DASAR (rev 17)
+            r["ki0"] = _angka(s.get("ki"))
+            r["kd0"] = _angka(s.get("kd"))
+            r["pid_adaptif"] = _bulat(s.get("ad"))
+            r["lambda_p"] = _angka(s.get("lp"))
+            r["lambda_i"] = _angka(s.get("li"))
+            r["lambda_d"] = _angka(s.get("ld"))
+            if m.get("kpe") is None:                           # firmware rev 16: gain tetap = dasar
+                r["kp"], r["ki"], r["kd"] = r["kp0"], r["ki0"], r["kd0"]
             r["pid_umax_pct"] = _angka(s.get("pm"))
             r["status_umur_ms"] = int(round((t_pc - self.status_t) * 1000))
             if r["setpoint_c"] is None:
