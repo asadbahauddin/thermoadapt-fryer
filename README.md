@@ -35,6 +35,8 @@ python Python/uji_logger.py        # uji otomatis (parser, WebSocket, end-to-end
 Berhenti dengan menutup jendela grafik atau Ctrl+C. CSV (ditulis tiap sampel, aman bila
 crash) dan PNG seluruh pengujian tersimpan di `Python/data/deepfryer_<tanggal>_<jam>.*`.
 Satu baris per sampel suhu (1 Hz); waktu memakai jam ESP32 (`ms`) sehingga bebas jitter WiFi.
+`suhu_c` adalah suhu tersaring firmware (tolak lonjakan + hold + Savitzky-Golay kausal);
+`suhu_mentah_c`, `suhu_ditahan`, `sensor_error_total` mencatat bacaan mentah dan kondisi sensor.
 Kolom `kp`, `ki`, `kd`, `pid_output_pct`, `buzzer_aktif` sudah ada tetapi kosong karena
 firmware belum mengirimnya.
 

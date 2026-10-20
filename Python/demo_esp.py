@@ -1,6 +1,6 @@
 """Sumber data SIMULASI untuk mencoba logger tanpa hardware (python logger.py --demo).
 
-Mengirim pesan JSON dengan format PERSIS seperti firmware rev 12 (temp 1 Hz, st 4 Hz),
+Mengirim pesan JSON dengan format PERSIS seperti firmware rev 15 (temp 1 Hz, st 4 Hz),
 dari plant FOPDT sederhana (bukan model alat sebenarnya). Sengaja disisipkan kasus
 sulit: paket hilang, sensor error, pesan rusak, limit switch kena sesaat, pesan msg.
 """
@@ -34,6 +34,8 @@ class SumberDemo(threading.Thread):
         hist_u = []
         seq = 0
         ms = 0
+        ec = 0
+        t_akhir = T
         sp = 160.0
         for k in range(10 ** 9):                 # 1 iterasi = 0.25 s waktu simulasi
             if self.berhenti.is_set():
@@ -59,14 +61,22 @@ class SumberDemo(threading.Thread):
                 ms = int(ts * 1000)
                 if seq in (50, 51):
                     pass                              # paket hilang
-                elif 300 <= seq < 303:
-                    self._kirim({"type": "temp", "t": None, "ok": False, "f": 1, "raw": "00010001",
-                                 "d": "FAULT: thermocouple LEPAS (open)", "up": int(ts),
-                                 "sp": sp, "seq": seq, "ms": ms})
+                elif 300 <= seq < 303:                # fault: firmware rev 15 menahan nilai <= 3 s, lalu null
+                    ec += 5
+                    if seq < 302:
+                        self._kirim({"type": "temp", "t": t_akhir, "ok": True, "raw": "00010001",
+                                     "d": "FAULT: thermocouple LEPAS (open)", "up": int(ts), "sp": sp,
+                                     "seq": seq, "ms": ms, "st": 0, "te": 0, "tr": None, "held": 1, "ec": ec})
+                    else:
+                        self._kirim({"type": "temp", "t": None, "ok": False, "f": 1, "raw": "00010001",
+                                     "d": "FAULT: thermocouple LEPAS (open)", "up": int(ts), "sp": sp,
+                                     "seq": seq, "ms": ms, "st": 0, "te": 0, "tr": None, "held": 0, "ec": ec})
                 else:
-                    tm = round(T + rnd.gauss(0, 0.2), 2)
-                    self._kirim({"type": "temp", "t": tm, "ok": True, "raw": "0A0C1234",
-                                 "d": "frame valid", "up": int(ts), "sp": sp, "seq": seq, "ms": ms})
+                    tr = round(T + rnd.gauss(0, 0.2), 2)
+                    t_akhir = round(T, 2)             # pengganti nilai tersaring
+                    self._kirim({"type": "temp", "t": t_akhir, "ok": True, "raw": "0A0C1234",
+                                 "d": "frame valid", "up": int(ts), "sp": sp, "seq": seq, "ms": ms,
+                                 "st": 0, "te": 0, "tr": tr, "held": 0, "ec": ec})
                 if seq == 100:
                     self._kirim("{rusak")
                 if seq == 200:

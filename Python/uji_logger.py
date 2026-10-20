@@ -30,6 +30,11 @@ TEMP_OK = ('{"type":"temp","t":152.25,"ok":true,"raw":"09840000","d":"frame vali
 TEMP_ERR = ('{"type":"temp","t":null,"ok":false,"f":1,"raw":"00010001",'
             '"d":"FAULT: thermocouple LEPAS (open)","up":13,"sp":160.0,"seq":13,"ms":13034}')
 TEMP_LAMA = '{"type":"temp","t":150.00,"ok":true,"raw":"09600000","d":"frame valid","up":5}'
+# rev 15 (snprintf broadcastTemp): nilai ditahan, mentah null
+TEMP_HELD = ('{"type":"temp","t":151.80,"ok":true,"raw":"00010001","d":"FAULT: thermocouple LEPAS (open)",'
+             '"up":14,"sp":160.0,"seq":14,"ms":14034,"st":1,"te":42,"tr":null,"held":1,"ec":7}')
+TEMP_REV15 = ('{"type":"temp","t":152.10,"ok":true,"raw":"09840000","d":"frame valid",'
+              '"up":15,"sp":160.0,"seq":15,"ms":15034,"st":1,"te":43,"tr":152.25,"held":0,"ec":7}')
 ST = ('{"type":"st","ls":[0,1,0,0],"raw":[1,0,1,1],"vr":[1,1,1,1],"il":[0,1,1,1],"pn":[35,17,34,39],'
       '"bn":0,"dx":1,"xp":-1200,"xm":0,"en":1,"sx":3000,"ax":3000,'
       '"sa":28,"sg":30,"sr":0,"sl":0,"um":500,"ux":2500,"cd":0,"od":55,"tc":180,'
@@ -66,6 +71,20 @@ class UjiParser(unittest.TestCase):
         self.assertIsNone(r["error_c"])
         self.assertEqual(r["sensor_ok"], 0)
         self.assertEqual(r["fault_kode"], 1)
+
+    def test_rev15_mentah_held_ec_steptest(self):
+        g = Penggabung()
+        r = g.baris_dari_temp(parse(TEMP_HELD), 0, "x", 0)
+        self.assertEqual(r["suhu_c"], 151.8)                 # nilai ditahan tetap tercatat
+        self.assertIsNone(r["suhu_mentah_c"])                # tr null -> kosong
+        self.assertEqual((r["suhu_ditahan"], r["sensor_error_total"]), (1, 7))
+        self.assertEqual((r["step_test_status"], r["step_test_elapsed_s"]), (1, 42))
+        r = g.baris_dari_temp(parse(TEMP_REV15), 1, "x", 1)
+        self.assertEqual((r["suhu_c"], r["suhu_mentah_c"], r["suhu_ditahan"]), (152.1, 152.25, 0))
+        r = g.baris_dari_temp(parse(TEMP_OK), 2, "x", 2)       # pesan rev 12 tanpa key baru
+        self.assertIsNone(r["suhu_mentah_c"])
+        self.assertIsNone(r["suhu_ditahan"])
+        self.assertIsNone(r["step_test_status"])
 
     def test_firmware_lama_tanpa_sp(self):
         g = Penggabung()
@@ -198,8 +217,12 @@ class UjiEndToEnd(unittest.TestCase):
             self.assertGreater(len(rows), 380)
             self.assertEqual(rows[-1]["paket_hilang"], "2")
             err = [r for r in rows if r["sensor_ok"] == "0"]
-            self.assertEqual(len(err), 3)
+            self.assertEqual(len(err), 1)                     # rev 15: 2 detik ditahan, lalu error
             self.assertTrue(all(r["suhu_c"] == "" for r in err))
+            held = [r for r in rows if r["suhu_ditahan"] == "1"]
+            self.assertEqual(len(held), 2)
+            self.assertTrue(all(r["suhu_c"] != "" and r["suhu_mentah_c"] == "" for r in held))
+            self.assertEqual(rows[-1]["sensor_error_total"], "15")
             self.assertTrue(any(r["ls_zatas_kena"] == "1" for r in rows))
             self.assertTrue(any("Limit Z kena" in r["pesan_esp"] for r in rows))
             self.assertTrue(all(r["kp"] == "" for r in rows))

@@ -1,7 +1,8 @@
-"""Parser pesan WebSocket firmware rev 12 -> baris CSV.
+"""Parser pesan WebSocket firmware rev 15 -> baris CSV (pesan rev 12-14 tetap terbaca).
 
 Firmware mengirim 3 jenis pesan JSON:
-  temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms
+  temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms, st, te (rev 14), tr, held, ec (rev 15)
+                t = suhu tersaring (SG + hold), tr = mentah
   st   (4 Hz) : ls[4], raw[4], vr[4], il[4], pn[4], bn, dx, xp, xm, en, sx, ax,
                 sa, sg, sr, sl, um, ux, cd, od, tc, dcc, dct, dcm, dcv, sp
   msg         : text
@@ -18,6 +19,10 @@ LS_NAMA = ["zatas", "zbawah", "xawal", "xakhir"]
 KOLOM = (
     ["waktu_iso", "elapsed_s", "esp_seq", "esp_ms", "paket_hilang",
      "suhu_c", "sensor_ok", "fault_kode", "max31855_raw", "max31855_diag",
+     # rev 15: suhu_c = tersaring (SG); mentah, flag ditahan, jumlah error sejak boot
+     "suhu_mentah_c", "suhu_ditahan", "sensor_error_total",
+     # rev 14: status step test di firmware (0 siap, 1 berjalan, 2 selesai, 3 berhenti) + detik berjalan
+     "step_test_status", "step_test_elapsed_s",
      "setpoint_c", "error_c",
      # belum ada di firmware rev 12 -> kosong
      "pid_output_pct", "kp", "ki", "kd",
@@ -49,6 +54,12 @@ def _angka(v):
         return None
     v = float(v)
     return v if math.isfinite(v) else None
+
+
+def _bulat(v):
+    """Penghitung/status -> int (agar CSV '15', bukan '15.0'), selain itu None."""
+    v = _angka(v)
+    return None if v is None else int(round(v))
 
 
 def _bukaan_pct(deg, tutup, buka):
@@ -133,6 +144,12 @@ class Penggabung:
         r["fault_kode"] = _angka(m.get("f")) if not ok else 0
         r["max31855_raw"] = m.get("raw") if isinstance(m.get("raw"), str) else None
         r["max31855_diag"] = m.get("d") if isinstance(m.get("d"), str) else None
+        r["suhu_mentah_c"] = _angka(m.get("tr"))          # null (fault) -> kosong
+        held = _angka(m.get("held"))
+        r["suhu_ditahan"] = None if held is None else int(held != 0)
+        r["sensor_error_total"] = _bulat(m.get("ec"))
+        r["step_test_status"] = _bulat(m.get("st"))
+        r["step_test_elapsed_s"] = _bulat(m.get("te"))
         r["setpoint_c"] = sp
         r["error_c"] = round(sp - suhu, 3) if (sp is not None and suhu is not None) else None
 
