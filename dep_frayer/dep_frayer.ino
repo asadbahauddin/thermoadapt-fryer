@@ -1,8 +1,16 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 19)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 20)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 20 (dari rev 19): PERBAIKAN "mentok di 0 derajat"
+ *   - Tombol -1/+1 dan kotak "Sudut" (sva/svad) dulu memakai setServoAngle() yang DIAM-DIAM
+ *     mengunci ke TUTUP..BUKA, sehingga di 0 derajat -1 tidak berbuat apa-apa. Sekarang semua
+ *     perintah manual memakai setServoAngleManual(): -30..180 derajat, dibatasi pulsa, dan
+ *     memberi pesan bila ditolak. PID & step test tetap dikunci TUTUP..BUKA.
+ *   - Halaman web dikirim dengan header no-cache (HP tidak memakai halaman lama).
+ *   - Versi firmware (FW_REV) tampil di judul halaman web.
  *
  * REV 19 (dari rev 18): kalibrasi boleh SUDUT NEGATIF (sampai SERVO_CAL_MIN_DEG, dibatasi pulsa
  *   >= SERVO_US_ABS_MIN), mis. TUTUP = -3 derajat bila di 0 derajat katup masih bocor.
@@ -127,6 +135,8 @@
 #include <TFT_eSPI.h>
 #include <Adafruit_MAX31855.h>
 #include <AccelStepper.h>
+
+#define FW_REV "rev 20"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---------------- PIN ----------------
 #define PIN_MAX_SCK 18
@@ -378,7 +388,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </style>
 </head>
 <body>
-  <h1>Deep Fryer - Monitor &amp; Kontrol</h1>
+  <h1>Deep Fryer - Monitor &amp; Kontrol <small id="fw" style="color:#777">(firmware ?)</small></h1>
   <div id="bench" class="err" style="font-weight:700"></div>
 
   <div class="box">
@@ -429,7 +439,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="box">
     <h2>Servo Katup Gas</h2>
     <div class="pos">Sudut: <span id="sva">0</span>&deg;
-      <small>(target <span id="svg">0</span>&deg; | &asymp; <span id="svp">0</span>% bukaan <span id="svr"></span>)</small></div>
+      <small>(target <span id="svg">0</span>&deg; | &asymp; <span id="svp">0</span>% bukaan <span id="svr"></span>)</small><br>
+      <small>Pulsa dikirim ke servo: <b id="svus">-</b> &micro;s (bila angka ini turun tapi servo tidak bergerak,
+      servo sudah mentok secara mekanis)</small></div>
     <div id="svl" class="err" style="font-weight:700;min-height:18px"></div>
     <button onclick="send('sv,0')" style="font-size:1.2em">TUTUP (<span class="lcd">0</span>&deg;)</button>
     <button onclick="send('sv,100')" style="font-size:1.2em">BUKA (<span class="lod">55</span>&deg;)</button><br>
@@ -442,7 +454,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div style="margin-top:8px">Sudut: <input id="sva_in" type="text" inputmode="text" placeholder="derajat"
         onkeydown="if(event.key==='Enter')svAngle()"> &deg; <button onclick="svAngle()">Gerak</button>
       &nbsp; <button onclick="send('svad,-1')">-1&deg;</button><button onclick="send('svad,1')">+1&deg;</button></div>
-    <small>Pemakaian normal dikunci antara TUTUP (<span class="lcd">0</span>&deg;) dan BUKA (<span class="lod">55</span>&deg;).</small>
+    <small>Manual (kotak sudut, -1/+1): bebas -30..180&deg; (dibatasi pulsa servo 300-3000 &micro;s).
+    PID &amp; step test dikunci antara TUTUP (<span class="lcd">0</span>&deg;) dan BUKA (<span class="lod">55</span>&deg;).</small>
 
     <div style="margin-top:12px;border-top:1px solid #333;padding-top:8px;text-align:left">
       <b>Kalibrasi katup</b> (PID harus OFF, step test tidak berjalan)<br>
@@ -783,6 +796,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       const span = m.od - m.cd;
       $('svp').textContent = span ? Math.round((m.sa - m.cd) / span * 100) : 0;
       $('svr').textContent = m.sr ? '| PULSA MENTAH ' + m.sr + ' us' : '';
+      if (typeof m.fw === 'string') $('fw').textContent = '(firmware ' + m.fw + ')';
+      $('svus').textContent = m.sr ? m.sr : Math.round(m.um + (m.ux - m.um) * m.sa / 180);
       $('svcd').textContent = m.cd; $('svod').textContent = m.od;
       svCd = m.cd; svOd = m.od; svSg = m.sg;
       document.querySelectorAll('.lcd').forEach(el => el.textContent = m.cd);
@@ -1026,6 +1041,25 @@ void servoSaveCal() {
 
 void setServoAngle(float deg) {
   deg = constrain(deg, (float)svClosedDeg, (float)svOpenDeg);   // dikunci tutup..buka
+  if (svLock && fabsf(deg - (float)svClosedDeg) > 0.5f) {
+    sendMsg("Servo terkunci pengaman: hanya boleh ke sudut TUTUP"); return;
+  }
+  svRawUs = 0;
+  svTargetDeg = deg;
+}
+
+// rev 20: gerak MANUAL (kotak sudut, -1/+1, kalibrasi). Tidak dikunci TUTUP..BUKA: boleh
+// SERVO_CAL_MIN_DEG..180, asalkan pulsa tetap SERVO_US_ABS_MIN..MAX. PID & step test tetap memakai
+// setServoAngle() yang dikunci TUTUP..BUKA. Saat PID/step test aktif, perintah manual sudah ditolak.
+void setServoAngleManual(float deg) {
+  if (deg < SERVO_CAL_MIN_DEG || deg > 180.0f) {
+    char m[48]; snprintf(m, sizeof(m), "Sudut harus %d..180 derajat", SERVO_CAL_MIN_DEG); sendMsg(m); return;
+  }
+  float us = servoUsFromDeg(deg);
+  if (us < SERVO_US_ABS_MIN || us > SERVO_US_ABS_MAX) {
+    char m[64]; snprintf(m, sizeof(m), "Ditolak: pulsa %.0f us di luar %d-%d us", us, SERVO_US_ABS_MIN, SERVO_US_ABS_MAX);
+    sendMsg(m); return;
+  }
   if (svLock && fabsf(deg - (float)svClosedDeg) > 0.5f) {
     sendMsg("Servo terkunci pengaman: hanya boleh ke sudut TUTUP"); return;
   }
@@ -1354,18 +1388,7 @@ void handleCommand(const char* cmd) {
   }
   // rev 18: kalibrasi - gerak ke sudut ABSOLUT 0..180 tanpa kunci TUTUP..BUKA.
   // (Ditolak saat PID aktif / step test lewat cek awalan "sv" di atas.)
-  if (sscanf(cmd, "svk,%d", &v) == 1) {
-    if (v < SERVO_CAL_MIN_DEG || v > 180) { sendMsg("Sudut kalibrasi harus -30..180"); return; }
-    float us = servoUsFromDeg((float)v);
-    if (us < SERVO_US_ABS_MIN || us > SERVO_US_ABS_MAX) {
-      char m[64]; snprintf(m, sizeof(m), "Ditolak: pulsa %.0f us di luar %d-%d us", us, SERVO_US_ABS_MIN, SERVO_US_ABS_MAX);
-      sendMsg(m); return;
-    }
-    if (svLock && v != svClosedDeg) { sendMsg("Servo terkunci pengaman: hanya boleh ke sudut TUTUP"); return; }
-    svRawUs = 0;
-    svTargetDeg = (float)v;
-    return;
-  }
+  if (sscanf(cmd, "svk,%d", &v) == 1) { setServoAngleManual((float)v); return; }
   if (sscanf(cmd, "svset,%c", &ax) == 1 && (ax == 'c' || ax == 'o')) {
     if (svRawUs > 0) { sendMsg("Keluar dari mode pulsa mentah dulu (Kembali ke sudut)"); return; }
     int deg = (int)lroundf(svTargetDeg);   // rev 19: benar juga utk sudut negatif
@@ -1389,8 +1412,8 @@ void handleCommand(const char* cmd) {
     svRawUs = v;
     return;
   }
-  if (sscanf(cmd, "svad,%d", &v) == 1) { setServoAngle(svTargetDeg + v); return; }
-  if (sscanf(cmd, "sva,%d", &v) == 1)  { setServoAngle((float)v); return; }
+  if (sscanf(cmd, "svad,%d", &v) == 1) { setServoAngleManual(lroundf(svTargetDeg) + v); return; }   // rev 20
+  if (sscanf(cmd, "sva,%d", &v) == 1)  { setServoAngleManual((float)v); return; }                   // rev 20
   if (sscanf(cmd, "sv,%d", &v) == 1)   { setServoPct(v); return; }
   // ---- setpoint suhu (rev 12): "sp,<derajat C>" ----
   if (strncmp(cmd, "sp,", 3) == 0) {
@@ -1444,13 +1467,14 @@ void broadcastStatus() {
     "\"sa\":%d,\"sg\":%d,\"sr\":%d,\"sl\":%d,\"um\":%d,\"ux\":%d,\"cd\":%d,\"od\":%d,\"tc\":%d,"
     "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f,"
     "\"kp\":%.3f,\"ki\":%.5f,\"kd\":%.3f,\"pm\":%.1f,"           // rev 16: pm = Umax PID (um = pulsa servo); kp/ki/kd = gain DASAR
-    "\"ad\":%d,\"lp\":%.4f,\"li\":%.5f,\"ld\":%.3f}",            // rev 17: adaptif ON/OFF + lambda
+    "\"ad\":%d,\"lp\":%.4f,\"li\":%.5f,\"ld\":%.3f,"             // rev 17: adaptif ON/OFF + lambda
+    "\"fw\":\"%s\"}",                                                // rev 20: versi firmware
     (int)BENCH_MODE, digitalRead(PIN_X_DIR), stepX.currentPosition(), stepX.distanceToGo() != 0,
     driversEnabled, spdX, accX,
     (int)lroundf(svCurDeg), (int)lroundf(svTargetDeg), (int)svRawUs, (int)svLock, svUsMin, svUsMax, svClosedDeg, svOpenDeg, (int)TEMP_CUTOFF_C,
     (int)lroundf(dcCur), (int)dcTarget, (int)(dcCap() * 100.0f + 0.5f), (int)MOTOR_SUPPLY_V, (float)gSetpoint,
     pidKp, pidKi, pidKd, pidUmax,
-    (int)pidAdapt, pidLp, pidLi, pidLd);
+    (int)pidAdapt, pidLp, pidLi, pidLd, FW_REV);
   ws.broadcastTXT(b);
 }
 
@@ -1784,7 +1808,12 @@ void setup() {
   Serial.print(F("AP ")); Serial.println(ok ? F("aktif") : F("GAGAL"));
   Serial.print(F("IP: ")); Serial.println(WiFi.softAPIP());
 
-  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/", HTTP_GET, []() {
+    // rev 20: larang cache, supaya browser/HP tidak memakai halaman lama setelah firmware di-upload
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
   server.begin();
   ws.begin();
   ws.onEvent(onWsEvent);
