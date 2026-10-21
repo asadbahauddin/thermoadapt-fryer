@@ -150,9 +150,9 @@ class UjiPid(unittest.TestCase):
               % (T_akhir, maks, maks - 150.0))
 
     def test_umax_terlalu_kecil_terdeteksi(self):
-        pid, rows = simulasi(detik=7200, sp=150.0, K=2.2)          # maks 30 + 2.2*40 = 118 C
+        pid, rows = simulasi(detik=7200, sp=150.0, K=2.2, pid=Pid(umax=40.0))   # maks 30 + 2.2*40 = 118 C
         self.assertLess(rows[-1][1], 119.0)
-        self.assertAlmostEqual(rows[-1][2], UMAX)                  # keluaran mentok di Umax
+        self.assertAlmostEqual(rows[-1][2], 40.0)                  # keluaran mentok di Umax
 
     def test_held_membekukan_integral(self):
         def g(i, T):

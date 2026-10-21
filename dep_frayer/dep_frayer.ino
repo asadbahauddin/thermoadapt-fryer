@@ -1,8 +1,15 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 20)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 21)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 21 (dari rev 20):
+ *   - FILTER SUHU diganti CASCADED FILTERING 3 TAHAP: Median-5 -> Moving Average-5 -> EMA
+ *     (alpha 0.3), menggantikan tolak-lonjakan + Savitzky-Golay rev 15. HOLD saat fault tetap.
+ *     Jeda ~1.3 dtk, std noise ~34%, lonjakan 1-2 sampel dibuang (lihat blok FILTER).
+ *   - Servo default hasil kalibrasi: TUTUP -3 derajat, BUKA 55 derajat. PID Umax default 100%
+ *     (seluruh rentang). Nilai di flash (bila pernah disimpan dari web) tetap diutamakan.
  *
  * REV 20 (dari rev 19): PERBAIKAN "mentok di 0 derajat"
  *   - Tombol -1/+1 dan kotak "Sudut" (sva/svad) dulu memakai setServoAngle() yang DIAM-DIAM
@@ -138,7 +145,7 @@
 #include <Adafruit_MAX31855.h>
 #include <AccelStepper.h>
 
-#define FW_REV "rev 20b"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 21"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---------------- PIN ----------------
 #define PIN_MAX_SCK 18
@@ -225,7 +232,8 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define SERVO_US_ABS_MAX        3000
 #define DEFAULT_SERVO_US_MIN    500      // us untuk 0 derajat   (BELUM terverifikasi)
 #define DEFAULT_SERVO_US_MAX    2500     // us untuk 180 derajat (BELUM terverifikasi)
-#define DEFAULT_SERVO_CLOSED_DEG 0       // sudut katup TUTUP (hasil kalibrasi: menutup di 0 derajat)
+#define DEFAULT_SERVO_CLOSED_DEG -3      // rev 21: TUTUP hasil kalibrasi di alat = -3 derajat
+                                         // (servo mentok; api sangat kecil yang tidak menaikkan suhu)
 #define DEFAULT_SERVO_OPEN_DEG   55      // sudut katup BUKA  (hasil kalibrasi: membuka di 55 derajat)
 #define SERVO_SLEW_DEG_S        0.0f     // 0 = tanpa batas laju (melompat ke target)
 #define SERVO_MIN_SPAN_DEG      5        // rev 18: BUKA - TUTUP minimal (derajat)
@@ -238,10 +246,9 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define TEMP_CUTOFF_C          180.0f   // NILAI AWAL: cek titik asap minyak
 
 // ---- PENANGANAN SENSOR SUHU (rev 15) ----
-#define SENSOR_FILTER_ENABLE   1        // 0 = perilaku lama: gTemp = bacaan mentah (tanpa tolak lonjakan/hold/SG)
+#define SENSOR_FILTER_ENABLE   1        // 0 = perilaku lama: gTemp = bacaan mentah (tanpa filter cascade/hold)
 #define SENSOR_SAMPLE_MS       200UL    // periode baca MAX31855 (konversi internal ~100 ms)
 #define SENSOR_PUBLISH_EVERY   5        // kirim ke web/logger & grafik LCD tiap 5 sampel = 1 Hz (seperti sebelumnya)
-#define SENSOR_MAX_JUMP_C      5.0f     // beda > ini dari sampel valid terakhir = lonjakan, ditolak
                                         // (minyak fisik tidak berubah 5 C dalam 200 ms)
 #define SENSOR_HOLD_MS         3000UL   // tahan nilai tersaring terakhir maks selama ini saat error
 static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_FAULT_MS (pengaman sensor)");
@@ -250,7 +257,8 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 #define PID_DEFAULT_KP     1.9f      // %bukaan per C   (dari step test: PI konservatif)
 #define PID_DEFAULT_KI     0.056f    // %bukaan per (C*dtk) = Kp/Ti, Ti ~ 34 dtk
 #define PID_DEFAULT_KD     0.0f      // mulai 0: derivatif memperbesar noise sensor
-#define PID_DEFAULT_UMAX   40.0f     // batas atas bukaan (persen); naikkan bertahap bila perlu
+#define PID_DEFAULT_UMAX   100.0f    // rev 21: PID boleh memakai seluruh rentang TUTUP(-3)..BUKA(55)
+                                     // (40% hanya sampai ~20 derajat). Bisa diturunkan dari web.
 #define PID_SP_RAMP_C_S    0.15f     // laju maks perubahan setpoint efektif (C/dtk) = 9 C/menit
                                      // (simulasi model dugaan: ramp 0.30 -> overshoot ~7 C, 0.15 -> ~4 C)
 #define PID_OVER_C         15.0f     // PID mati bila suhu >= setpoint + ini
@@ -1639,51 +1647,59 @@ void tftHardReset() {
   digitalWrite(PIN_TFT_RST, HIGH); delay(150);
 }
 
-// ---------------- FILTER SENSOR SUHU (rev 15) ----------------
-// Urutan per sampel (200 ms): fault MAX31855 / NaN -> tidak valid; beda > SENSOR_MAX_JUMP_C
-// dari sampel valid terakhir -> lonjakan, tidak valid. Sampel valid masuk jendela SG.
-// Sampel tidak valid: HOLD (output = nilai tersaring terakhir, nilai itu juga diisikan ke
-// jendela supaya jarak waktu antar sampel tetap seragam) selama <= SENSOR_HOLD_MS sejak sampel
-// valid terakhir. Lewat itu: output NAN (perilaku lama -> pengaman servo/step test bekerja),
-// jendela dikosongkan, dan sampel valid berikutnya diterima tanpa cek lonjakan sebagai acuan
-// baru (agar acuan yang keliru tidak mengunci sensor selamanya).
-//
-// SAVITZKY-GOLAY KAUSAL: jendela 11 sampel, polinomial orde 2, dievaluasi di titik TERAKHIR
-// jendela (end-point) sehingga hanya memakai sampel masa lalu. Koefisien dibuat di PC, BUKAN
-// dihitung di ESP32:
-//     from scipy.signal import savgol_coeffs
-//     savgol_coeffs(11, 2, pos=10, use='dot')   # scipy 1.10.1; urutan sampel terlama -> terbaru
-// Hasilnya pecahan eksak berpenyebut 143: [18, 2, -9, -15, -16, -12, -3, 11, 30, 54, 83] / 143,
-// jumlah = 143/143 = 1 (gain DC = 1).
-// SIFAT (diuji di Python, lihat laporan rev 15), dan BUKAN "jeda ~5 sampel": karena fit
-// polinomial orde 2 dievaluasi di titik ujung, rampa dan kurva kuadrat diteruskan TANPA jeda
-// (kenaikan suhu linear tidak tertunda, jadi dead time step test tidak bertambah oleh filter
-// untuk respons yang mulus). Harganya: penghalusan lemah (std noise turun hanya ke ~76%),
-// 58% lonjakan yang lolos prefilter ikut masuk ke output, dan respons terhadap loncatan
-// mendadak overshoot ~25% lalu undershoot ~14% selama ~2 detik. Jadi nilai SG pada transien
-// tajam BISA sesaat lebih tinggi/rendah dari mentah. Prefilter lonjakan di atas menahan
-// sebagian besar lonjakan sebelum masuk SG.
-// Awal data / setelah reset: output = sampel mentah sampai jendela penuh (11 sampel = 2,2 s).
-#define SG_WINDOW 11
-static const float SG_COEF[SG_WINDOW] = {
-  18.0f / 143, 2.0f / 143, -9.0f / 143, -15.0f / 143, -16.0f / 143, -12.0f / 143,
-  -3.0f / 143, 11.0f / 143, 30.0f / 143, 54.0f / 143, 83.0f / 143
-};
+// ---------------- FILTER SENSOR SUHU: CASCADED FILTERING 3 TAHAP (rev 21) ----------------
+// Menggantikan Savitzky-Golay (rev 15). Per sampel valid (200 ms):
+//   Tahap 1  MEDIAN-5      : median 5 sampel terakhir -> membuang lonjakan 1-2 sampel berturut
+//                            (frame MAX31855 rusak/noise EMI) tanpa ambang tetap.
+//   Tahap 2  MOVING AVG-5  : rata-rata 5 keluaran median -> menekan noise acak (std / ~sqrt(5)).
+//   Tahap 3  EMA (alpha)   : low-pass orde-1  y += alpha*(x - y) -> menghaluskan sisa riak.
+// SIFAT (simulasi Python, Ts 200 ms, alpha 0.3; lihat Python/uji_filter_sensor.py):
+//   - jeda pada suhu yang naik/turun linear ~6.3 sampel = ~1.3 dtk (median 2 + MA 2 + EMA 2.3).
+//     Jeda ini IKUT masuk ke dead time hasil step test dan ke loop PID (kecil dibanding dead
+//     time plant ~10-20 dtk, tetapi tidak nol).
+//   - std noise acak turun ke ~34% (SG rev 15: ~76%).
+//   - lonjakan 1 atau 2 sampel berturut dibuang 100%; 3 sampel berturut lolos sebagian (~45%).
+//   - respons loncatan: tanpa overshoot, 90% tercapai ~2 dtk.
+//   - pengaman suhu-lebih (TEMP_CUTOFF, PID_OVER) memakai nilai tersaring -> ikut tertunda ~1.3 dtk.
+// Awal data / setelah reset: median & MA memakai sampel yang ada (1..5), EMA mulai dari nilai
+// pertama -> tidak menunggu jendela penuh.
+// FAULT (NaN dari MAX31855): HOLD nilai tersaring terakhir maks SENSOR_HOLD_MS (filter dibekukan,
+// tidak diisi); lewat itu gTemp = NAN (pengaman servo/step test/PID bekerja seperti semula) dan
+// seluruh filter direset. gLastValidMs hanya diperbarui oleh sampel valid.
+#define FILT_MED_N      5
+#define FILT_MA_N       5
+#define FILT_EMA_ALPHA  0.3f
 
 struct SensorFilter {
-  float    win[SG_WINDOW];   // buffer sirkular
-  uint8_t  n = 0, head = 0;  // jumlah terisi, posisi tulis berikutnya
-  bool     haveRef = false;  // ada sampel valid acuan
-  float    lastGood = NAN;   // sampel valid terakhir (acuan lonjakan)
-  float    lastOut  = NAN;   // output tersaring terakhir (yang ditahan saat error)
+  float    med[FILT_MED_N]; uint8_t mn = 0, mh = 0;   // tahap 1: buffer sirkular median
+  float    ma[FILT_MA_N];   uint8_t an = 0, ah = 0;   // tahap 2: buffer sirkular moving average
+  float    ema = NAN;                                  // tahap 3
+  bool     have = false;                               // sudah ada sampel valid sejak reset
+  float    lastOut = NAN;                              // keluaran terakhir (yang ditahan saat error)
   uint32_t lastGoodMs = 0;
 
-  void reset() { n = 0; head = 0; haveRef = false; }
-  void push(float v) { win[head] = v; head = (head + 1) % SG_WINDOW; if (n < SG_WINDOW) n++; }
-  float sg() const {                       // jendela penuh: urut terlama -> terbaru
-    float s = 0;
-    for (int k = 0; k < SG_WINDOW; k++) s += SG_COEF[k] * win[(head + k) % SG_WINDOW];
-    return s;
+  void reset() { mn = mh = an = ah = 0; ema = NAN; have = false; }
+
+  float stage1Median(float v) {
+    med[mh] = v; mh = (mh + 1) % FILT_MED_N; if (mn < FILT_MED_N) mn++;
+    float t[FILT_MED_N];
+    for (int i = 0; i < mn; i++) t[i] = med[i];          // urutan tidak penting untuk median
+    for (int i = 1; i < mn; i++) {                       // insertion sort (n <= 5)
+      float x = t[i]; int j = i - 1;
+      while (j >= 0 && t[j] > x) { t[j + 1] = t[j]; j--; }
+      t[j + 1] = x;
+    }
+    return (mn % 2) ? t[mn / 2] : 0.5f * (t[mn / 2 - 1] + t[mn / 2]);
+  }
+  float stage2MovAvg(float v) {
+    ma[ah] = v; ah = (ah + 1) % FILT_MA_N; if (an < FILT_MA_N) an++;
+    float sum = 0;
+    for (int i = 0; i < an; i++) sum += ma[i];           // dijumlah ulang: tanpa drift pembulatan
+    return sum / an;
+  }
+  float stage3Ema(float v) {
+    ema = isnan(ema) ? v : ema + FILT_EMA_ALPHA * (v - ema);
+    return ema;
   }
 };
 SensorFilter sf;
@@ -1693,27 +1709,23 @@ SensorFilter sf;
 float sensorFilterStep(float tv, uint32_t now, bool* held, bool* accepted) {
   *held = false; *accepted = false;
   bool valid = !isnan(tv);
-#if SENSOR_FILTER_ENABLE
-  if (valid && sf.haveRef && fabsf(tv - sf.lastGood) > SENSOR_MAX_JUMP_C) valid = false;   // lonjakan
   if (!valid) gErrCount = gErrCount + 1;
+#if SENSOR_FILTER_ENABLE
   if (valid) {
-    sf.haveRef = true; sf.lastGood = tv; sf.lastGoodMs = now;
-    sf.push(tv);
-    sf.lastOut = (sf.n < SG_WINDOW) ? tv : sf.sg();
+    sf.have = true; sf.lastGoodMs = now;
+    sf.lastOut = sf.stage3Ema(sf.stage2MovAvg(sf.stage1Median(tv)));
     *accepted = true;
     return sf.lastOut;
   }
-  if (sf.haveRef && (now - sf.lastGoodMs) <= SENSOR_HOLD_MS) {   // HOLD
-    sf.push(sf.lastOut);
+  if (sf.have && (now - sf.lastGoodMs) <= SENSOR_HOLD_MS) {      // HOLD: filter dibekukan
     *held = true;
     return sf.lastOut;
   }
   sf.reset();                                                     // lewat batas hold
   return NAN;
 #else
-  if (!valid) gErrCount = gErrCount + 1;
   *accepted = valid;
-  return tv;                                                      // perilaku lama
+  return tv;                                                      // perilaku lama (tanpa filter)
 #endif
 }
 

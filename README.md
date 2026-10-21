@@ -39,7 +39,7 @@ Kolom PID (firmware rev 16-17): `pid_aktif`, `pid_output_pct`, `setpoint_efektif
 (gain yang SEDANG dipakai, berubah tiap detik saat Adaptive PID), `kp0`/`ki0`/`kd0` (gain dasar),
 `pid_adaptif`, `lambda_p`/`lambda_i`/`lambda_d`,
 `pid_umax_pct`. Grafik live: suhu vs setpoint vs setpoint efektif, dan sudut servo vs keluaran PID.
-`suhu_c` adalah suhu tersaring firmware (tolak lonjakan + hold + Savitzky-Golay kausal);
+`suhu_c` adalah suhu tersaring firmware (Cascaded Filtering 3 tahap: Median-5 → Moving Average-5 → EMA, + hold saat sensor error);
 `suhu_mentah_c`, `suhu_ditahan`, `sensor_error_total` mencatat bacaan mentah dan kondisi sensor.
 Kolom `buzzer_aktif` sudah ada tetapi kosong karena
 firmware belum mengirimnya.
