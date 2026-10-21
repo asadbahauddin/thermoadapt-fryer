@@ -1,8 +1,11 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 18)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 19)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 19 (dari rev 18): kalibrasi boleh SUDUT NEGATIF (sampai SERVO_CAL_MIN_DEG, dibatasi pulsa
+ *   >= SERVO_US_ABS_MIN), mis. TUTUP = -3 derajat bila di 0 derajat katup masih bocor.
  *
  * REV 18 (dari rev 17): KALIBRASI KATUP lewat kotak angka (tanpa slider)
  *   - Web: sudut uji 0..180 per 1 derajat ("svk,<deg>", bebas dari kunci TUTUP..BUKA), simpan
@@ -214,6 +217,9 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define DEFAULT_SERVO_OPEN_DEG   55      // sudut katup BUKA  (hasil kalibrasi: membuka di 55 derajat)
 #define SERVO_SLEW_DEG_S        0.0f     // 0 = tanpa batas laju (melompat ke target)
 #define SERVO_MIN_SPAN_DEG      5        // rev 18: BUKA - TUTUP minimal (derajat)
+#define SERVO_CAL_MIN_DEG       -30      // rev 19: kalibrasi boleh di bawah 0 derajat (sudut negatif =
+                                         // pulsa < pulsa 0 derajat, mis. -1 = 500 - 11 = ~489 us).
+                                         // Batas sebenarnya: pulsa >= SERVO_US_ABS_MIN (~ -18 derajat default)
 
 #define SERVO_SAFETY           false    // true: paksa katup ke sudut TUTUP bila sensor error/suhu lewat batas
 #define SENSOR_FAULT_MS        5000UL
@@ -433,14 +439,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <button onclick="send('sv,50')">50%</button>
       <button onclick="send('sv,75')">75%</button>
       <button onclick="send('sv,100')">100%</button></div>
-    <div style="margin-top:8px">Sudut: <input id="sva_in" type="text" inputmode="numeric" placeholder="derajat"
+    <div style="margin-top:8px">Sudut: <input id="sva_in" type="text" inputmode="text" placeholder="derajat"
         onkeydown="if(event.key==='Enter')svAngle()"> &deg; <button onclick="svAngle()">Gerak</button>
       &nbsp; <button onclick="send('svad,-1')">-1&deg;</button><button onclick="send('svad,1')">+1&deg;</button></div>
     <small>Pemakaian normal dikunci antara TUTUP (<span class="lcd">0</span>&deg;) dan BUKA (<span class="lod">55</span>&deg;).</small>
 
     <div style="margin-top:12px;border-top:1px solid #333;padding-top:8px;text-align:left">
       <b>Kalibrasi katup</b> (PID harus OFF, step test tidak berjalan)<br>
-      Sudut uji: <input id="svk_in" type="text" inputmode="numeric" placeholder="0-180"
+      Sudut uji: <input id="svk_in" type="text" inputmode="text" placeholder="-30..180"
         onkeydown="if(event.key==='Enter')svCalGo(0)"> &deg;
       <button onclick="svCalGo(0)">Gerak</button>
       <button onclick="svCalGo(-1)">-1&deg;</button><button onclick="svCalGo(1)">+1&deg;</button><br>
@@ -451,8 +457,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       180&deg; = <input id="sumax" type="text" inputmode="numeric"> &micro;s
       <button onclick="svCalPulse()">Simpan pulsa</button><br>
       <small>Cara: gerakkan per 1&deg; ke arah menutup sampai gas benar-benar berhenti (api padam, tidak ada aliran),
-      lalu "Simpan sbg TUTUP". Bila di 0&deg; masih bocor dan servo masih bisa berputar, turunkan pulsa 0&deg;
-      sedikit-sedikit (mis. 10 &micro;s), simpan, lalu ulangi dari 0&deg;. Berhenti bila servo berdengung/menekan stopper.
+      lalu "Simpan sbg TUTUP". Bila di 0&deg; masih bocor, lanjut ke -1&deg;, -2&deg;, ... (sudut negatif = pulsa di bawah
+      pulsa 0&deg;; batas sekitar -18&deg; dgn pulsa default). Berhenti bila servo berdengung/menekan stopper.
       <b>PERINGATAN:</b> TUTUP = katup RAPAT, api PADAM. Saat PID/servo membuka lagi, gas keluar TANPA api
       kecuali ada pemantik/pilot yang selalu menyala. Harus ada orang di dekat mesin.</small>
     </div>
@@ -551,7 +557,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function svCalGo(step){
     const now = Math.round(num('svk_in'));                 // dasar = isi kotak (langsung terbarui tiap klik)
     let d = step === 0 ? now : (isFinite(now) ? now : svSg) + step;
-    if (!isFinite(d) || d < 0 || d > 180) { $('log').textContent = 'Sudut uji harus 0-180'; return; }
+    if (!isFinite(d) || d < -30 || d > 180) { $('log').textContent = 'Sudut uji harus -30..180'; return; }
     $('svk_in').value = d; clean(['svk_in']);
     send('svk,' + d);
   }
@@ -1008,7 +1014,7 @@ bool servoPulseOk(int a, int b) {
 }
 
 bool servoAnglesOk(int c, int o) {
-  return c >= 0 && o <= 180 && o - c >= SERVO_MIN_SPAN_DEG;
+  return c >= SERVO_CAL_MIN_DEG && o <= 180 && o - c >= SERVO_MIN_SPAN_DEG;
 }
 
 void servoSaveCal() {
@@ -1349,7 +1355,12 @@ void handleCommand(const char* cmd) {
   // rev 18: kalibrasi - gerak ke sudut ABSOLUT 0..180 tanpa kunci TUTUP..BUKA.
   // (Ditolak saat PID aktif / step test lewat cek awalan "sv" di atas.)
   if (sscanf(cmd, "svk,%d", &v) == 1) {
-    if (v < 0 || v > 180) { sendMsg("Sudut kalibrasi harus 0-180"); return; }
+    if (v < SERVO_CAL_MIN_DEG || v > 180) { sendMsg("Sudut kalibrasi harus -30..180"); return; }
+    float us = servoUsFromDeg((float)v);
+    if (us < SERVO_US_ABS_MIN || us > SERVO_US_ABS_MAX) {
+      char m[64]; snprintf(m, sizeof(m), "Ditolak: pulsa %.0f us di luar %d-%d us", us, SERVO_US_ABS_MIN, SERVO_US_ABS_MAX);
+      sendMsg(m); return;
+    }
     if (svLock && v != svClosedDeg) { sendMsg("Servo terkunci pengaman: hanya boleh ke sudut TUTUP"); return; }
     svRawUs = 0;
     svTargetDeg = (float)v;
@@ -1357,7 +1368,7 @@ void handleCommand(const char* cmd) {
   }
   if (sscanf(cmd, "svset,%c", &ax) == 1 && (ax == 'c' || ax == 'o')) {
     if (svRawUs > 0) { sendMsg("Keluar dari mode pulsa mentah dulu (Kembali ke sudut)"); return; }
-    int deg = (int)(svTargetDeg + 0.5f);
+    int deg = (int)lroundf(svTargetDeg);   // rev 19: benar juga utk sudut negatif
     // rev 18: arah menutup = sudut mengecil (hasil kalibrasi awal: tutup 0, buka 55);
     // TUTUP harus lebih kecil dari BUKA minimal SERVO_MIN_SPAN_DEG agar % bukaan bermakna.
     if (ax == 'c' && deg > svOpenDeg - SERVO_MIN_SPAN_DEG) {
