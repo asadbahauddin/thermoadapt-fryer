@@ -1,9 +1,10 @@
-"""Uji ketahanan firmware rev 22 TANPA hardware:  python uji_robust.py
+"""Uji ketahanan firmware rev 23 TANPA hardware:  python uji_robust.py
 
 1. Cek statis dep_frayer.ino: tidak ada delay() di kode (non-blocking), watchdog dipasang di
    loop() dan uiTask, uiTask menyerahkan CPU tiap putaran (multitasking kooperatif).
 2. Simulasi garis waktu uiTask (porting lcdService + putaran uiTask): selama LCD di-reset,
-   sampling suhu tetap berjalan; LCD tidak digambar saat belum siap; reset tiap 30 dtk.
+   sampling suhu tetap berjalan; LCD tidak digambar saat belum siap; reset otomatis (bila
+   LCD_REINIT_MS > 0) dan reset manual dari web ("lcdr").
    Delay internal tft.init() library dimodelkan 295 ms (blocking, sesuai isi TFT_eSPI).
 """
 import os
@@ -46,6 +47,13 @@ class UjiStatis(unittest.TestCase):
         ui = re.search(r"void uiTask\(void\*\) \{(.*?)\n\}", KODE, re.S).group(1)
         self.assertIn("vTaskDelay(pdMS_TO_TICKS(10))", ui)
 
+    def test_reset_manual_hanya_pasang_flag(self):
+        # perintah dari loop() (core 1) tidak boleh menyentuh SPI; hanya flag untuk uiTask
+        blok = re.search(r'strcmp\(cmd, "lcdr"\) == 0\) \{(.*?)\n  \}', KODE, re.S).group(1)
+        self.assertIn("gLcdResetReq = true", blok)
+        for terlarang in ("tft.", "thermocouple.", "SPI.", "lcdState"):
+            self.assertNotIn(terlarang, blok)
+
     def test_tidak_ada_string_di_ui(self):
         upd = re.search(r"void uiUpdate\(\) \{(.*?)\n\}", KODE, re.S).group(1)
         self.assertNotIn("toString()", upd)
@@ -54,7 +62,9 @@ class UjiStatis(unittest.TestCase):
 class UjiGarisWaktu(unittest.TestCase):
     """Porting lcdService() + putaran uiTask, langkah 10 ms."""
 
-    def jalankan(self, durasi_ms, init_ms=295):
+    def jalankan(self, durasi_ms, init_ms=295, reinit_ms=None, manual_ms=()):
+        reinit_ms = c("LCD_REINIT_MS") if reinit_ms is None else reinit_ms
+        manual = sorted(manual_ms)
         st, t0, sensor_ready = "START", 0, False
         sampel, gambar_saat_tidak_siap, resets = [], 0, 0
         last_temp = last_ui = 0
@@ -75,7 +85,11 @@ class UjiGarisWaktu(unittest.TestCase):
             if sensor_ready and (first or now - last_temp >= c("SENSOR_SAMPLE_MS")):
                 first, last_temp = False, now
                 sampel.append(now)
-            if c("LCD_REINIT_MS") > 0 and st == "READY" and now - last_init >= c("LCD_REINIT_MS"):
+            minta = bool(manual) and now >= manual[0]
+            if minta and st == "READY":                      # gLcdResetReq dari web
+                manual.pop(0)
+                last_init, st, resets = now, "START", resets + 1
+            if reinit_ms > 0 and st == "READY" and now - last_init >= reinit_ms:
                 last_init, st, resets = now, "START", resets + 1
             if now - last_ui >= 150:
                 if st == "READY":
@@ -85,8 +99,21 @@ class UjiGarisWaktu(unittest.TestCase):
             now += 10                                    # vTaskDelay(10 ms)
         return sampel, resets
 
-    def test_reset_tiap_30_detik_dan_sampling_tetap_jalan(self):
+    def test_default_tanpa_reset_otomatis(self):
+        self.assertEqual(c("LCD_REINIT_MS"), 0)
         sampel, resets = self.jalankan(125_000)
+        self.assertEqual(resets, 0)
+        celah = [b - a for a, b in zip(sampel, sampel[1:])]
+        self.assertLessEqual(max(celah), 200 + 10)          # tanpa reset: sampling rata
+
+    def test_reset_manual_dari_web(self):
+        sampel, resets = self.jalankan(60_000, manual_ms=(10_000, 40_000))
+        self.assertEqual(resets, 2)
+        celah = [b - a for a, b in zip(sampel, sampel[1:])]
+        self.assertLessEqual(max(celah), 200 + 295 + 10)
+
+    def test_mekanisme_otomatis_bila_diaktifkan(self):
+        sampel, resets = self.jalankan(125_000, reinit_ms=30_000)
         self.assertEqual(resets, 4)                      # 30, 60, 90, 120 dtk
         celah = [b - a for a, b in zip(sampel, sampel[1:])]
         self.assertLessEqual(max(celah), 200 + 295 + 10)  # celah terbesar = tft.init() library
@@ -94,7 +121,7 @@ class UjiGarisWaktu(unittest.TestCase):
 
     def test_tanpa_state_machine_celah_lebih_besar(self):
         # pembanding: rev 21 (delay 210 ms + init) -> celah ~505 ms; rev 22 hanya init ~295 ms
-        sampel, _ = self.jalankan(65_000)
+        sampel, _ = self.jalankan(65_000, reinit_ms=30_000)
         celah = sorted(b - a for a, b in zip(sampel, sampel[1:]))
         self.assertLess(celah[-1], 210 + 295 + 200)
 

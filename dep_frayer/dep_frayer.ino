@@ -1,8 +1,16 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 22)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 23)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 23 (dari rev 22):
+ *   - Reset LCD otomatis tiap 30 dtk DIMATIKAN (LCD_REINIT_MS 0): pengguna menilai rev 21 lebih
+ *     stabil. Diganti tombol "Reset LCD" di web (perintah "lcdr") yang menjalankan urutan sama:
+ *     pin RESET -> tft.init() -> MAX31855 begin() -> gambar ulang (non-blocking, di uiTask).
+ *     Pin RESET saja TIDAK cukup: setelah reset hardware ILI9488 kembali ke kondisi awal
+ *     (sleep, format warna & rotasi hilang) sehingga harus diinisialisasi ulang.
+ *   - Watchdog, diagnosa, dan pola non-blocking rev 22 tetap.
  *
  * REV 22 (dari rev 21): ROBUST
  *   - LCD di-reset (hardware) + diinisialisasi ulang tiap LCD_REINIT_MS (30 dtk), lalu semua
@@ -165,10 +173,11 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 22"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 23"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
-#define LCD_REINIT_MS   30000UL   // reset + inisialisasi ulang LCD tiap 30 dtk (0 = mati)
+#define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
+                                  // reset manual lewat tombol "Reset LCD" di web. >0 = reset otomatis tiap N ms
 #define WDT_TIMEOUT_S   10        // loop() atau uiTask macet > 10 dtk -> ESP restart
                                   // (setelah restart: katup ke TUTUP, PID mati, motor diam)
 
@@ -344,6 +353,7 @@ volatile uint32_t gErrCount = 0;             // jumlah sampel tidak valid (fault
 volatile bool  pidOn = false;                // PID suhu aktif (rev 16)
 volatile bool  gUiForce = false;             // rev 22: paksa gambar ulang semua elemen LCD
 volatile uint32_t gLcdResets = 0;            // rev 22: jumlah reset LCD sejak boot
+volatile bool  gLcdResetReq = false;         // rev 23: permintaan reset LCD manual dari web (loop -> uiTask)
 TaskHandle_t   gUiTask = nullptr;            // rev 22: untuk cek sisa stack uiTask
 char gResetWhy[24] = "?";                    // rev 22: alasan reset/boot terakhir
 
@@ -583,7 +593,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div id="log"></div>
   </div>
   <small id="info"></small><br>
-  <small id="diag"></small>
+  <small id="diag"></small><br>
+  <button onclick="send('lcdr')">Reset LCD</button>
+  <small>Pin RESET LCD + inisialisasi ulang + gambar ulang (~0,5 dtk). Pakai bila layar putih/membeku.</small>
 
 <script>
   const MAXPTS = 120, data = [];
@@ -1365,6 +1377,13 @@ void handleCommand(const char* cmd) {
     if (!hadPid) sendMsg("Semua gerak dihentikan");   // pesan PID tidak ditimpa
     return;
   }
+  // ---- rev 23: "lcdr" reset LCD manual. Hanya memasang flag; reset dikerjakan uiTask (core 0)
+  // karena hanya task itu yang memakai bus SPI LCD/MAX31855 (tidak ada akses SPI dari 2 core).
+  if (strcmp(cmd, "lcdr") == 0) {
+    gLcdResetReq = true;
+    sendMsg("Reset LCD diminta");
+    return;
+  }
   // ---- rev 17: "pida,<0|1>" adaptif ON/OFF (OFF = PID biasa, untuk pembanding) ----
   if (sscanf(cmd, "pida,%d", &v) == 1) {
     pidAdapt = (v != 0);
@@ -1818,7 +1837,8 @@ void lcdService(uint32_t now) {
 void uiTask(void*) {
   esp_task_wdt_add(NULL);           // rev 22: uiTask diawasi watchdog
 
-  uint32_t lastTemp = 0, lastUi = 0, lastLcdInit = millis();
+  uint32_t lastTemp = 0, lastUi = 0;
+  [[maybe_unused]] uint32_t lastLcdInit = millis();   // hanya dipakai bila LCD_REINIT_MS > 0
   uint8_t  pubCnt = SENSOR_PUBLISH_EVERY - 1;     // sampel pertama langsung dikirim
   bool first = true;
   for (;;) {
@@ -1848,11 +1868,19 @@ void uiTask(void*) {
         if (lcdState == LCD_READY) chartDraw();          // LCD sedang di-reset -> jangan gambar
       }
     }
-    if (LCD_REINIT_MS > 0 && lcdState == LCD_READY && now - lastLcdInit >= LCD_REINIT_MS) {
-      lastLcdInit = now;                                     // rev 22: reset LCD tiap 30 dtk
+    if (gLcdResetReq && lcdState == LCD_READY) {         // rev 23: reset manual dari web
+      gLcdResetReq = false;
+      lastLcdInit = now;
       lcdState = LCD_START;
       gLcdResets = gLcdResets + 1;
     }
+#if LCD_REINIT_MS > 0
+    if (lcdState == LCD_READY && now - lastLcdInit >= LCD_REINIT_MS) {
+      lastLcdInit = now;                                     // rev 22: reset LCD otomatis tiap N ms
+      lcdState = LCD_START;
+      gLcdResets = gLcdResets + 1;
+    }
+#endif
     if (lcdState == LCD_READY && now - lastUi >= 150) { lastUi = now; uiUpdate(); }
     esp_task_wdt_reset();                                       // rev 22: uiTask masih hidup
     vTaskDelay(pdMS_TO_TICKS(10));
