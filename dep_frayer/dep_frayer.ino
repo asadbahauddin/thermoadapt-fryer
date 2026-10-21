@@ -1,8 +1,27 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 21)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 22)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 22 (dari rev 21): ROBUST
+ *   - LCD di-reset (hardware) + diinisialisasi ulang tiap LCD_REINIT_MS (30 dtk), lalu semua
+ *     elemen digambar ulang. MAX31855 di-begin() ulang (bus SPI dipakai bersama LCD).
+ *     Sampling suhu tertunda ~0.4 dtk saat itu; layar berkedip sesaat.
+ *   - WATCHDOG: loop() dan uiTask diawasi; macet > WDT_TIMEOUT_S (10 dtk) -> ESP restart
+ *     sendiri. Setelah restart katup ke TUTUP, PID mati, motor diam (aman, tidak lanjut sendiri).
+ *   - Alasan boot terakhir (POWER_ON / TASK_WDT / BROWNOUT / PANIC ...), heap minimum,
+ *     sisa stack uiTask, dan jumlah reset LCD tampil di web (JSON "st": rr, hp, sk, lr).
+ *   - IP di LCD diformat tanpa String (tidak memecah heap tiap 150 ms).
+ *   - NON-BLOCKING / MULTITASKING KOOPERATIF / BLINK WITHOUT DELAY:
+ *       core 1 loop(): web, WebSocket, stepper, step test, servo (20 ms), motor DC (10 ms),
+ *                      buzzer (pola ms), PID (tiap sampel 1 Hz), status (250 ms); semua berbasis
+ *                      millis(), tanpa delay().
+ *       core 0 uiTask: servis LCD (state machine reset), sampel suhu (200 ms), LCD (150 ms),
+ *                      reset LCD (30 dtk); vTaskDelay(10 ms) menyerahkan CPU tiap putaran.
+ *     Reset LCD dulu delay(210 ms) -> sekarang state machine millis(). Sisa tunggu: delay
+ *     internal tft.init() library (~295 ms, tiap 30 dtk, hanya di core 0) dan
+ *     delayMicroseconds(2) waktu setup CS MAX31855 (syarat datasheet).
  *
  * REV 21 (dari rev 20):
  *   - FILTER SUHU diganti CASCADED FILTERING 3 TAHAP: Median-5 -> Moving Average-5 -> EMA
@@ -144,8 +163,14 @@
 #include <TFT_eSPI.h>
 #include <Adafruit_MAX31855.h>
 #include <AccelStepper.h>
+#include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 21"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 22"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+
+// ---- ROBUST (rev 22) ----
+#define LCD_REINIT_MS   30000UL   // reset + inisialisasi ulang LCD tiap 30 dtk (0 = mati)
+#define WDT_TIMEOUT_S   10        // loop() atau uiTask macet > 10 dtk -> ESP restart
+                                  // (setelah restart: katup ke TUTUP, PID mati, motor diam)
 
 // ---------------- PIN ----------------
 #define PIN_MAX_SCK 18
@@ -317,6 +342,10 @@ volatile float gTempRaw = NAN;               // bacaan mentah MAX31855 terakhir 
 volatile bool  gTempHeld = false;            // true: gTemp = nilai ditahan (sensor error sesaat)
 volatile uint32_t gErrCount = 0;             // jumlah sampel tidak valid (fault/lonjakan) sejak boot
 volatile bool  pidOn = false;                // PID suhu aktif (rev 16)
+volatile bool  gUiForce = false;             // rev 22: paksa gambar ulang semua elemen LCD
+volatile uint32_t gLcdResets = 0;            // rev 22: jumlah reset LCD sejak boot
+TaskHandle_t   gUiTask = nullptr;            // rev 22: untuk cek sisa stack uiTask
+char gResetWhy[24] = "?";                    // rev 22: alasan reset/boot terakhir
 
 // Snapshot sampel TERKIRIM (1 Hz) untuk PID (rev 16). Ditulis uiTask (core 0), dibaca loop()
 // (core 1). volatile menjamin tiap nilai 32-bit utuh, tapi TIDAK menjamin suhu/waktu/flag
@@ -553,7 +582,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button class="stop" onclick="send('stop')">STOP SEMUA GERAK</button>
     <div id="log"></div>
   </div>
-  <small id="info"></small>
+  <small id="info"></small><br>
+  <small id="diag"></small>
 
 <script>
   const MAXPTS = 120, data = [];
@@ -809,6 +839,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       $('svp').textContent = span ? Math.round((m.sa - m.cd) / span * 100) : 0;
       $('svr').textContent = m.sr ? '| PULSA MENTAH ' + m.sr + ' us' : '';
       if (typeof m.fw === 'string') $('fw').textContent = '(firmware ' + m.fw + ')';
+      if (typeof m.rr === 'string')                         // rev 22: diagnosa ketahanan
+        $('diag').textContent = 'Boot terakhir: ' + m.rr + ' | heap min ' + m.hp + ' B | sisa stack LCD '
+          + m.sk + ' B | reset LCD ' + m.lr + 'x';
       $('svus').textContent = m.sr ? m.sr : Math.round(m.um + (m.ux - m.um) * m.sa / 180);
       $('svcd').textContent = m.cd; $('svod').textContent = m.od;
       svCd = m.cd; svOd = m.od; svSg = m.sg;
@@ -1480,13 +1513,15 @@ void broadcastStatus() {
     "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f,"
     "\"kp\":%.3f,\"ki\":%.5f,\"kd\":%.3f,\"pm\":%.1f,"           // rev 16: pm = Umax PID (um = pulsa servo); kp/ki/kd = gain DASAR
     "\"ad\":%d,\"lp\":%.4f,\"li\":%.5f,\"ld\":%.3f,"             // rev 17: adaptif ON/OFF + lambda
-    "\"fw\":\"%s\"}",                                                // rev 20: versi firmware
+    "\"fw\":\"%s\",\"rr\":\"%s\",\"hp\":%lu,\"sk\":%u,\"lr\":%lu}",  // rev 20 versi; rev 22 diagnosa
     (int)BENCH_MODE, digitalRead(PIN_X_DIR), stepX.currentPosition(), stepX.distanceToGo() != 0,
     driversEnabled, spdX, accX,
     (int)lroundf(svCurDeg), (int)lroundf(svTargetDeg), (int)svRawUs, (int)svLock, svUsMin, svUsMax, svClosedDeg, svOpenDeg, (int)TEMP_CUTOFF_C,
     (int)lroundf(dcCur), (int)dcTarget, (int)(dcCap() * 100.0f + 0.5f), (int)MOTOR_SUPPLY_V, (float)gSetpoint,
     pidKp, pidKi, pidKd, pidUmax,
-    (int)pidAdapt, pidLp, pidLi, pidLd, FW_REV);
+    (int)pidAdapt, pidLp, pidLi, pidLd, FW_REV,
+    gResetWhy, (unsigned long)ESP.getMinFreeHeap(),
+    gUiTask ? (unsigned)uxTaskGetStackHighWaterMark(gUiTask) : 0u, (unsigned long)gLcdResets);
   ws.broadcastTXT(b);
 }
 
@@ -1592,10 +1627,19 @@ void uiStatic() {
   tft.drawFastHLine(0, 24, tft.width(), TFT_DARKGREY);
 }
 
+void fieldReset(Field& f) { f.last[0] = 1; f.last[1] = 0; f.color = 0; }
+
 void uiUpdate() {
   static Field fTemp, fSens, fZ, fX, fDrv, fSv, fMsg, fWifi;
   static int8_t lHit[LS_COUNT] = { -1, -1, -1, -1 }, lRaw[LS_COUNT] = { -1, -1, -1, -1 };
   char b[80];
+
+  if (gUiForce) {                    // rev 22: LCD baru di-reset -> semua elemen digambar ulang
+    gUiForce = false;
+    Field* all[] = { &fTemp, &fSens, &fZ, &fX, &fDrv, &fSv, &fMsg, &fWifi };
+    for (Field* f : all) fieldReset(*f);
+    for (int i = 0; i < LS_COUNT; i++) { lHit[i] = -1; lRaw[i] = -1; }
+  }
 
   float t = gTemp;
   if (isnan(t)) {
@@ -1636,16 +1680,19 @@ void uiUpdate() {
   strncpy(m, gMsg[0] ? gMsg : "-", sizeof(m) - 1); m[sizeof(m) - 1] = 0;
   putText(fMsg, m, 10, 270, 2, TFT_YELLOW, 470);
 
-  snprintf(b, sizeof(b), "WiFi AP: %s  IP: %s  klien:%d  up:%lus", AP_SSID, AP_IP.toString().c_str(), WiFi.softAPgetStationNum(), millis() / 1000);
+  // rev 22: IP diformat langsung (tanpa String -> tidak membebani/memecah heap tiap 150 ms)
+  snprintf(b, sizeof(b), "WiFi AP: %s  IP: %u.%u.%u.%u  klien:%d  up:%lus", AP_SSID,
+           AP_IP[0], AP_IP[1], AP_IP[2], AP_IP[3], WiFi.softAPgetStationNum(), millis() / 1000);
   putText(fWifi, b, 6, 302, 1, TFT_DARKGREY, 470);
 }
 
-void tftHardReset() {
-  pinMode(PIN_TFT_RST, OUTPUT);
-  digitalWrite(PIN_TFT_RST, HIGH); delay(10);
-  digitalWrite(PIN_TFT_RST, LOW);  delay(50);
-  digitalWrite(PIN_TFT_RST, HIGH); delay(150);
-}
+// rev 22: reset LCD NON-BLOCKING (pola blink-without-delay). Dulu delay(10)+delay(50)+delay(150)
+// menghentikan uiTask 210 ms. Sekarang tiap tahap hanya memeriksa millis() lalu kembali, sehingga
+// pembacaan suhu tetap berjalan selama pin RESET LCD ditahan.
+enum LcdState : uint8_t { LCD_START, LCD_RST_HIGH, LCD_RST_LOW, LCD_RST_WAIT, LCD_READY };
+LcdState lcdState = LCD_START;
+uint32_t lcdT0 = 0;
+bool     sensorReady = false;       // MAX31855 sudah di-begin() (setelah init LCD pertama)
 
 // ---------------- FILTER SENSOR SUHU: CASCADED FILTERING 3 TAHAP (rev 21) ----------------
 // Menggantikan Savitzky-Golay (rev 15). Per sampel valid (200 ms):
@@ -1729,19 +1776,55 @@ float sensorFilterStep(float tv, uint32_t now, bool* held, bool* accepted) {
 #endif
 }
 
-void uiTask(void*) {
-  tftHardReset();
-  tft.init();
-  tft.setRotation(1);               // landscape 480x320
-  uiStatic();
-  if (!thermocouple.begin()) Serial.println(F("MAX31855 begin() GAGAL: cek wiring CS5, SO19, SCK18, VCC 3V3"));
+// Dipanggil tiap putaran uiTask; TIDAK pernah menunggu. Urutan (sama dgn boot):
+//   RESET HIGH 10 ms -> LOW 50 ms -> HIGH 150 ms -> tft.init() -> MAX31855 begin() lagi
+// LCD & MAX31855 berbagi bus SPI dan tft.init() mengatur ulang bus, jadi MAX31855 di-begin()
+// sesudahnya. CATATAN JUJUR: tft.init() milik library TFT_eSPI berisi delay internal ~295 ms
+// (reset 150 + sleep-out ILI9488 120 + 25) yang tidak bisa dipecah; delay itu menyerahkan CPU
+// (vTaskDelay), jadi loop() di core 1 tetap jalan, tetapi sampling suhu tertahan ~0.3 dtk.
+void lcdService(uint32_t now) {
+  switch (lcdState) {
+    case LCD_START:
+      pinMode(PIN_TFT_RST, OUTPUT);
+      digitalWrite(PIN_TFT_RST, HIGH);
+      lcdT0 = now; lcdState = LCD_RST_HIGH;
+      break;
+    case LCD_RST_HIGH:
+      if (now - lcdT0 >= 10)  { digitalWrite(PIN_TFT_RST, LOW);  lcdT0 = now; lcdState = LCD_RST_LOW; }
+      break;
+    case LCD_RST_LOW:
+      if (now - lcdT0 >= 50)  { digitalWrite(PIN_TFT_RST, HIGH); lcdT0 = now; lcdState = LCD_RST_WAIT; }
+      break;
+    case LCD_RST_WAIT:
+      if (now - lcdT0 >= 150) {
+        tft.init();
+        tft.setRotation(1);           // landscape 480x320
+        uiStatic();
+        if (!thermocouple.begin()) Serial.println(F("MAX31855 begin() GAGAL: cek wiring CS5, SO19, SCK18, VCC 3V3"));
+        sensorReady = true;
+        gUiForce = true;              // semua field LCD digambar ulang
+        chartDraw();
+        lcdState = LCD_READY;
+      }
+      break;
+    case LCD_READY:
+      break;
+  }
+}
 
-  uint32_t lastTemp = 0, lastUi = 0;
+// uiTask (core 0) = MULTITASKING KOOPERATIF: tiap putaran menjalankan potongan kerja pendek
+// berbasis millis() (servis LCD, sampel suhu 200 ms, gambar LCD 150 ms, reset LCD 30 dtk),
+// lalu vTaskDelay(10 ms) menyerahkan CPU. Tidak ada delay() di dalam putaran ini.
+void uiTask(void*) {
+  esp_task_wdt_add(NULL);           // rev 22: uiTask diawasi watchdog
+
+  uint32_t lastTemp = 0, lastUi = 0, lastLcdInit = millis();
   uint8_t  pubCnt = SENSOR_PUBLISH_EVERY - 1;     // sampel pertama langsung dikirim
   bool first = true;
   for (;;) {
     uint32_t now = millis();
-    if (first || now - lastTemp >= SENSOR_SAMPLE_MS) {
+    lcdService(now);                                         // reset/init LCD bertahap
+    if (sensorReady && (first || now - lastTemp >= SENSOR_SAMPLE_MS)) {
       first = false; lastTemp = now;
       gRaw = maxReadRaw();
       float tv = thermocouple.readCelsius();          // NAN kalau fault
@@ -1762,10 +1845,16 @@ void uiTask(void*) {
         gTempSeq = gTempSeq + 1;
         gTempFresh = true;
         chartPush(out);
-        chartDraw();
+        if (lcdState == LCD_READY) chartDraw();          // LCD sedang di-reset -> jangan gambar
       }
     }
-    if (now - lastUi >= 150) { lastUi = now; uiUpdate(); }   // laju LCD seperti sebelumnya
+    if (LCD_REINIT_MS > 0 && lcdState == LCD_READY && now - lastLcdInit >= LCD_REINIT_MS) {
+      lastLcdInit = now;                                     // rev 22: reset LCD tiap 30 dtk
+      lcdState = LCD_START;
+      gLcdResets = gLcdResets + 1;
+    }
+    if (lcdState == LCD_READY && now - lastUi >= 150) { lastUi = now; uiUpdate(); }
+    esp_task_wdt_reset();                                       // rev 22: uiTask masih hidup
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -1805,8 +1894,30 @@ void setup() {
 
   buzzInit();
 
-  Serial.begin(115200);
-  delay(200);
+  Serial.begin(115200);              // rev 22: tanpa delay (ESP32 tidak perlu menunggu port serial)
+
+  // rev 22: alasan reset (TASK_WDT = ESP restart karena macet; BROWNOUT = tegangan drop)
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  strcpy(gResetWhy, "POWER_ON"); break;
+    case ESP_RST_SW:       strcpy(gResetWhy, "SOFTWARE"); break;
+    case ESP_RST_PANIC:    strcpy(gResetWhy, "PANIC/CRASH"); break;
+    case ESP_RST_INT_WDT:  strcpy(gResetWhy, "INT_WDT"); break;
+    case ESP_RST_TASK_WDT: strcpy(gResetWhy, "TASK_WDT"); break;
+    case ESP_RST_WDT:      strcpy(gResetWhy, "WDT"); break;
+    case ESP_RST_BROWNOUT: strcpy(gResetWhy, "BROWNOUT"); break;
+    case ESP_RST_EXT:      strcpy(gResetWhy, "TOMBOL_EN"); break;
+    default:               strcpy(gResetWhy, "LAIN"); break;
+  }
+  Serial.print(F("Alasan boot: ")); Serial.println(gResetWhy);
+
+  // rev 22: watchdog. Macet > WDT_TIMEOUT_S -> ESP restart (setup: katup TUTUP, PID & motor mati)
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t wdtCfg = { .timeout_ms = WDT_TIMEOUT_S * 1000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wdtCfg);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+  esp_task_wdt_add(NULL);           // loop() (loopTask) diawasi
 
   // Semua input limit pakai pull-up EKSTERNAL 10k (GPIO34/35/39 tidak punya pull internal)
   for (int i = 0; i < LS_COUNT; i++) pinMode(LS[i].pin, INPUT);
@@ -1834,11 +1945,12 @@ void setup() {
   ws.begin();
   ws.onEvent(onWsEvent);
 
-  xTaskCreatePinnedToCore(uiTask, "ui", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(uiTask, "ui", 8192, NULL, 1, &gUiTask, 0);
   buzzPlay(1);                      // bip pendek saat boot = buzzer hidup
 }
 
 void loop() {
+  esp_task_wdt_reset();             // rev 22: loop() masih hidup
   server.handleClient();
   ws.loop();
 
