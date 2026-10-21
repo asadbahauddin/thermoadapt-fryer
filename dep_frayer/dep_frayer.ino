@@ -1,8 +1,18 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 17)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 18)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 18 (dari rev 17): KALIBRASI KATUP lewat kotak angka (tanpa slider)
+ *   - Web: sudut uji 0..180 per 1 derajat ("svk,<deg>", bebas dari kunci TUTUP..BUKA), simpan
+ *     sebagai TUTUP/BUKA ("svset,c|o"), koreksi pulsa 0/180 derajat ("svcal,<us0>,<us180>").
+ *     Tersimpan di flash dan DIMUAT saat boot (rev 13 sempat memaku 0/55).
+ *     Syarat: TUTUP < BUKA, selisih >= 5 derajat. Ditolak saat PID aktif / step test.
+ *   - Slider sudut dihapus; diganti kotak sudut + tombol -1/+1.
+ *   - Keputusan pengguna: TUTUP = katup RAPAT (api PADAM), tidak ada sudut api minimum.
+ *     PID 0%, STOP, PID OFF, akhir step test -> gas berhenti. Saat katup membuka lagi gas keluar
+ *     TANPA api kecuali ada pemantik/pilot yang selalu menyala. Harus ada orang di dekat mesin.
  *
  * REV 17 (dari rev 16): ADAPTIVE PID (BELUM diuji di alat)
  *   - Hukum adaptasi sama dgn model Simulink: Kp = Kp0 + lambda_p|e|, Ki = Ki0 + lambda_i|e|,
@@ -25,7 +35,7 @@
  *   - PENGAMAN: PID mati + katup TUTUP bila sensor error > SENSOR_FAULT_MS, tidak ada sampel
  *     suhu baru > SENSOR_FAULT_MS (uiTask macet), suhu >= setpoint + PID_OVER_C atau
  *     >= TEMP_CUTOFF_C - 5, tombol STOP, atau step test berjalan. Servo manual ditolak saat PID
- *     aktif. Tutup (0 derajat) = api paling redup, BUKAN padam: PID tidak bisa mendinginkan.
+ *     aktif. [rev 18: TUTUP kini dikalibrasi RAPAT = api PADAM, lihat REV 18.] PID tidak bisa mendinginkan.
  *   - Setpoint dibatasi <= PID_SP_MAX_C (TEMP_CUTOFF_C - 15) selama PID aktif.
  *   - JSON "temp" + pe (PID aktif), pu (keluaran %), se (setpoint efektif);
  *     "st" + kp, ki, kd, pm (Umax %). ("um" TETAP pulsa servo 0 derajat; Umax sengaja "pm".)
@@ -203,6 +213,7 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define DEFAULT_SERVO_CLOSED_DEG 0       // sudut katup TUTUP (hasil kalibrasi: menutup di 0 derajat)
 #define DEFAULT_SERVO_OPEN_DEG   55      // sudut katup BUKA  (hasil kalibrasi: membuka di 55 derajat)
 #define SERVO_SLEW_DEG_S        0.0f     // 0 = tanpa batas laju (melompat ke target)
+#define SERVO_MIN_SPAN_DEG      5        // rev 18: BUKA - TUTUP minimal (derajat)
 
 #define SERVO_SAFETY           false    // true: paksa katup ke sudut TUTUP bila sensor error/suhu lewat batas
 #define SENSOR_FAULT_MS        5000UL
@@ -406,40 +417,50 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
     PID mati otomatis + katup TUTUP bila: sensor error &gt;5 dtk, suhu &ge; setpoint+15 &deg;C, atau STOP.
-    TUTUP = api paling redup, bukan padam. Harus ada orang di dekat mesin.</small>
+    TUTUP = katup rapat, api PADAM (lihat kalibrasi katup). Harus ada orang di dekat mesin.</small>
   </div>
 
   <div class="box">
-    <h2>Servo Katup Gas (0-180&deg;)</h2>
+    <h2>Servo Katup Gas</h2>
     <div class="pos">Sudut: <span id="sva">0</span>&deg;
       <small>(target <span id="svg">0</span>&deg; | &asymp; <span id="svp">0</span>% bukaan <span id="svr"></span>)</small></div>
     <div id="svl" class="err" style="font-weight:700;min-height:18px"></div>
-    <input id="svs" type="range" min="0" max="55" value="0"
-           oninput="$('svv').textContent=this.value" onchange="send('sva,'+this.value)">
-    <div>Slider: <span id="svv">0</span>&deg; (0&deg; = TUTUP, 55&deg; = BUKA)</div>
-    <button onclick="send('sv,0')" style="font-size:1.2em">TUTUP (0&deg;)</button>
-    <button onclick="send('sv,100')" style="font-size:1.2em">BUKA (55&deg;)</button><br>
+    <button onclick="send('sv,0')" style="font-size:1.2em">TUTUP (<span class="lcd">0</span>&deg;)</button>
+    <button onclick="send('sv,100')" style="font-size:1.2em">BUKA (<span class="lod">55</span>&deg;)</button><br>
     <div style="margin-top:8px">Bukaan:
       <button onclick="send('sv,0')">0%</button>
       <button onclick="send('sv,25')">25%</button>
       <button onclick="send('sv,50')">50%</button>
       <button onclick="send('sv,75')">75%</button>
       <button onclick="send('sv,100')">100%</button></div>
-    <div style="margin-top:8px">Halus:
-      <button onclick="send('svad,-5')">-5</button>
-      <button onclick="send('svad,-1')">-1</button>
-      <button onclick="send('svad,1')">+1</button>
-      <button onclick="send('svad,5')">+5</button></div>
-    <small>Sudut dikunci 0&deg;..55&deg; (tutup..buka). Tidak ada kalibrasi lagi.</small>
-    <div style="display:none">
-      <b id="svcd"></b><b id="svod"></b>
-      <input id="sumin" type="number"><input id="sumax" type="number">
+    <div style="margin-top:8px">Sudut: <input id="sva_in" type="text" inputmode="numeric" placeholder="derajat"
+        onkeydown="if(event.key==='Enter')svAngle()"> &deg; <button onclick="svAngle()">Gerak</button>
+      &nbsp; <button onclick="send('svad,-1')">-1&deg;</button><button onclick="send('svad,1')">+1&deg;</button></div>
+    <small>Pemakaian normal dikunci antara TUTUP (<span class="lcd">0</span>&deg;) dan BUKA (<span class="lod">55</span>&deg;).</small>
+
+    <div style="margin-top:12px;border-top:1px solid #333;padding-top:8px;text-align:left">
+      <b>Kalibrasi katup</b> (PID harus OFF, step test tidak berjalan)<br>
+      Sudut uji: <input id="svk_in" type="text" inputmode="numeric" placeholder="0-180"
+        onkeydown="if(event.key==='Enter')svCalGo(0)"> &deg;
+      <button onclick="svCalGo(0)">Gerak</button>
+      <button onclick="svCalGo(-1)">-1&deg;</button><button onclick="svCalGo(1)">+1&deg;</button><br>
+      <button onclick="send('svset,c')">Simpan sudut ini sbg TUTUP</button>
+      <button onclick="send('svset,o')">Simpan sudut ini sbg BUKA</button><br>
+      Tersimpan: TUTUP <b id="svcd">-</b>&deg;, BUKA <b id="svod">-</b>&deg;<br>
+      Pulsa servo: 0&deg; = <input id="sumin" type="text" inputmode="numeric"> &micro;s,
+      180&deg; = <input id="sumax" type="text" inputmode="numeric"> &micro;s
+      <button onclick="svCalPulse()">Simpan pulsa</button><br>
+      <small>Cara: gerakkan per 1&deg; ke arah menutup sampai gas benar-benar berhenti (api padam, tidak ada aliran),
+      lalu "Simpan sbg TUTUP". Bila di 0&deg; masih bocor dan servo masih bisa berputar, turunkan pulsa 0&deg;
+      sedikit-sedikit (mis. 10 &micro;s), simpan, lalu ulangi dari 0&deg;. Berhenti bila servo berdengung/menekan stopper.
+      <b>PERINGATAN:</b> TUTUP = katup RAPAT, api PADAM. Saat PID/servo membuka lagi, gas keluar TANPA api
+      kecuali ada pemantik/pilot yang selalu menyala. Harus ada orang di dekat mesin.</small>
     </div>
   </div>
 
   <div class="box">
     <h2>Step Test (open-loop)</h2>
-    <div>Bukaan: <input id="stang" type="number" value="30" min="1" max="55" step="1"> &deg; (maks 55)
+    <div>Bukaan: <input id="stang" type="number" value="30" min="1" max="55" step="1"> &deg; (maks <span class="lod">55</span>)
       &nbsp; Batas suhu: <input id="stmax" type="number" value="170" min="60" max="175"> &deg;C
       &nbsp; Durasi: <input id="stdur" type="number" value="20" min="1" max="60"> menit</div>
     <button onclick="startStep()" style="font-size:1.1em">MULAI TEST</button>
@@ -519,6 +540,26 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     send('pidk,' + k[0].toFixed(3) + ',' + k[1].toFixed(5) + ',' + k[2].toFixed(3) + ',' + k[3].toFixed(1));
     clean(['pkp','pki','pkd','pum']);
   }
+  // ---- servo & kalibrasi (rev 18) ----
+  let svCd = 0, svOd = 55, svSg = 0;
+  function num(id){ return parseFloat(String($(id).value).replace(',', '.')); }
+  function svAngle(){
+    const d = Math.round(num('sva_in'));
+    if (!isFinite(d)) { $('log').textContent = 'Sudut tidak valid'; return; }
+    send('sva,' + d); clean(['sva_in']);
+  }
+  function svCalGo(step){
+    const now = Math.round(num('svk_in'));                 // dasar = isi kotak (langsung terbarui tiap klik)
+    let d = step === 0 ? now : (isFinite(now) ? now : svSg) + step;
+    if (!isFinite(d) || d < 0 || d > 180) { $('log').textContent = 'Sudut uji harus 0-180'; return; }
+    $('svk_in').value = d; clean(['svk_in']);
+    send('svk,' + d);
+  }
+  function svCalPulse(){
+    const a = Math.round(num('sumin')), b = Math.round(num('sumax'));
+    if (!isFinite(a) || !isFinite(b)) { $('log').textContent = 'Pulsa tidak valid'; return; }
+    send('svcal,' + a + ',' + b); clean(['sumin','sumax']);
+  }
   function pidLam(){
     const l = ['plp','pli','pld'].map(id => parseFloat($(id).value));
     if (l.some(x => !isFinite(x))) { $('log').textContent = 'Lambda tidak valid'; return; }
@@ -591,7 +632,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     let T0 = 0; for (let i = 0; i < k; i++) T0 += p[i][1]; T0 /= k;
     const rise = p[n-1][1] - T0;
     const L = (T0 - best.a) / best.s;                  // waktu garis singgung memotong T0 (dtk)
-    const ang = parseFloat($('stang').value), u = ang / 55 * 100;   // % bukaan (0..55 deg = 0..100%)
+    const ang = parseFloat($('stang').value), u = (ang - svCd) / (svOd - svCd) * 100;   // % bukaan dari TUTUP..BUKA tersimpan
     const Kp_ = best.s / u;                            // gain proses: degC/dtk per % bukaan
     stFit = best; drawStep();
     let h = '<b>Hasil identifikasi</b><br>'
@@ -737,7 +778,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       $('svp').textContent = span ? Math.round((m.sa - m.cd) / span * 100) : 0;
       $('svr').textContent = m.sr ? '| PULSA MENTAH ' + m.sr + ' us' : '';
       $('svcd').textContent = m.cd; $('svod').textContent = m.od;
-      if (document.activeElement !== $('svs')) { $('svs').value = m.sg; $('svv').textContent = m.sg; }
+      svCd = m.cd; svOd = m.od; svSg = m.sg;
+      document.querySelectorAll('.lcd').forEach(el => el.textContent = m.cd);
+      document.querySelectorAll('.lod').forEach(el => el.textContent = m.od);
+      $('stang').max = m.od;
+      setField('sva_in', m.sg); setField('svk_in', m.sg);
       setField('sumin', m.um); setField('sumax', m.ux);
       $('svl').textContent = m.sl == 1 ? 'TERKUNCI: sensor suhu bermasalah, katup dipaksa ke sudut TUTUP'
                            : m.sl == 2 ? 'TERKUNCI: suhu melewati batas ' + m.tc + ' C, katup dipaksa ke sudut TUTUP' : '';
@@ -958,6 +1003,14 @@ float servoUsFromDeg(float deg) {
   return (float)svUsMin + (float)(svUsMax - svUsMin) * deg / 180.0f;
 }
 
+bool servoPulseOk(int a, int b) {
+  return a >= SERVO_US_ABS_MIN && a <= SERVO_US_ABS_MAX && b >= SERVO_US_ABS_MIN && b <= SERVO_US_ABS_MAX && abs(a - b) >= 200;
+}
+
+bool servoAnglesOk(int c, int o) {
+  return c >= 0 && o <= 180 && o - c >= SERVO_MIN_SPAN_DEG;
+}
+
 void servoSaveCal() {
   prefs.begin("fryer", false);
   prefs.putInt("usmin", svUsMin); prefs.putInt("usmax", svUsMax);
@@ -1090,7 +1143,7 @@ void pidDisable(const char* why) {
   bool was = pidOn;
   pidOn = false; pidOut = 0; pidI = 0;
   pidAdaptGains(0.0f, 0.0f);                 // rev 17: gain dipakai kembali = gain dasar
-  setServoAngle((float)svClosedDeg);         // katup ke TUTUP (api paling redup)
+  setServoAngle((float)svClosedDeg);         // katup ke TUTUP (rev 18: rapat, api padam)
   if (was && why) { sendMsg(why); buzzPlay(3); }
 }
 
@@ -1285,7 +1338,7 @@ void handleCommand(const char* cmd) {
   }
   // ---- servo ----
   if (sscanf(cmd, "svcal,%d,%d", &a, &b) == 2) {
-    if (a < SERVO_US_ABS_MIN || a > SERVO_US_ABS_MAX || b < SERVO_US_ABS_MIN || b > SERVO_US_ABS_MAX || abs(a - b) < 200) {
+    if (!servoPulseOk(a, b)) {
       sendMsg("Kalibrasi pulsa ditolak: 300-3000 us dan selisih minimal 200"); return;
     }
     svUsMin = a; svUsMax = b;
@@ -1293,12 +1346,30 @@ void handleCommand(const char* cmd) {
     sendMsg("Kalibrasi pulsa disimpan");
     return;
   }
+  // rev 18: kalibrasi - gerak ke sudut ABSOLUT 0..180 tanpa kunci TUTUP..BUKA.
+  // (Ditolak saat PID aktif / step test lewat cek awalan "sv" di atas.)
+  if (sscanf(cmd, "svk,%d", &v) == 1) {
+    if (v < 0 || v > 180) { sendMsg("Sudut kalibrasi harus 0-180"); return; }
+    if (svLock && v != svClosedDeg) { sendMsg("Servo terkunci pengaman: hanya boleh ke sudut TUTUP"); return; }
+    svRawUs = 0;
+    svTargetDeg = (float)v;
+    return;
+  }
   if (sscanf(cmd, "svset,%c", &ax) == 1 && (ax == 'c' || ax == 'o')) {
     if (svRawUs > 0) { sendMsg("Keluar dari mode pulsa mentah dulu (Kembali ke sudut)"); return; }
     int deg = (int)(svTargetDeg + 0.5f);
+    // rev 18: arah menutup = sudut mengecil (hasil kalibrasi awal: tutup 0, buka 55);
+    // TUTUP harus lebih kecil dari BUKA minimal SERVO_MIN_SPAN_DEG agar % bukaan bermakna.
+    if (ax == 'c' && deg > svOpenDeg - SERVO_MIN_SPAN_DEG) {
+      sendMsg("Ditolak: TUTUP harus lebih kecil dari BUKA (selisih min 5 derajat)"); return;
+    }
+    if (ax == 'o' && deg < svClosedDeg + SERVO_MIN_SPAN_DEG) {
+      sendMsg("Ditolak: BUKA harus lebih besar dari TUTUP (selisih min 5 derajat)"); return;
+    }
     if (ax == 'c') svClosedDeg = deg; else svOpenDeg = deg;
     servoSaveCal();
-    sendMsg(ax == 'c' ? "Sudut TUTUP disimpan" : "Sudut BUKA disimpan");
+    char m[48]; snprintf(m, sizeof(m), "%s = %d derajat disimpan", ax == 'c' ? "TUTUP" : "BUKA", deg);
+    sendMsg(m);
     return;
   }
   if (sscanf(cmd, "svus,%d", &v) == 1) {
@@ -1673,8 +1744,10 @@ void setup() {
   pidAdaptGains(0.0f, 0.0f);
   gSetpoint = (isfinite(spSaved) && spSaved >= SETPOINT_MIN_C && spSaved <= SETPOINT_MAX_C)
               ? spSaved : DEFAULT_SETPOINT_C;
-  svClosedDeg = DEFAULT_SERVO_CLOSED_DEG;   // sudut tutup/buka dipaku (tidak diambil dari flash)
-  svOpenDeg   = DEFAULT_SERVO_OPEN_DEG;
+  // rev 18: kalibrasi TUTUP/BUKA & pulsa diambil dari flash (rev 13 sempat dipaku 0/55);
+  // nilai rusak/tidak wajar -> default.
+  if (!servoPulseOk(svUsMin, svUsMax)) { svUsMin = DEFAULT_SERVO_US_MIN; svUsMax = DEFAULT_SERVO_US_MAX; }
+  if (!servoAnglesOk(svClosedDeg, svOpenDeg)) { svClosedDeg = DEFAULT_SERVO_CLOSED_DEG; svOpenDeg = DEFAULT_SERVO_OPEN_DEG; }
   svTargetDeg = svCurDeg = (float)svClosedDeg;
   servoPwmBegin();
   servoWriteUs(servoUsFromDeg(svCurDeg));
