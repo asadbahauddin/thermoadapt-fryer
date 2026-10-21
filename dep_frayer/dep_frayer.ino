@@ -22,6 +22,8 @@
  *     Syarat: TUTUP < BUKA, selisih >= 5 derajat. Ditolak saat PID aktif / step test.
  *   - Slider sudut dihapus; diganti kotak sudut + tombol -1/+1.
  *   - Keputusan pengguna: TUTUP = katup RAPAT (api PADAM), tidak ada sudut api minimum.
+ *     [Hasil kalibrasi di alat: servo mentok di -3 derajat dan katup masih menyisakan api kecil yang
+ *      tidak mampu menaikkan suhu -> TUTUP = api minimum (berfungsi seperti pilot), BUKAN padam.]
  *     PID 0%, STOP, PID OFF, akhir step test -> gas berhenti. Saat katup membuka lagi gas keluar
  *     TANPA api kecuali ada pemantik/pilot yang selalu menyala. Harus ada orang di dekat mesin.
  *
@@ -136,7 +138,7 @@
 #include <Adafruit_MAX31855.h>
 #include <AccelStepper.h>
 
-#define FW_REV "rev 20"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 20b"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---------------- PIN ----------------
 #define PIN_MAX_SCK 18
@@ -433,7 +435,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
     PID mati otomatis + katup TUTUP bila: sensor error &gt;5 dtk, suhu &ge; setpoint+15 &deg;C, atau STOP.
-    TUTUP = katup rapat, api PADAM (lihat kalibrasi katup). Harus ada orang di dekat mesin.</small>
+    TUTUP = sudut terkecil hasil kalibrasi (di alat ini masih api kecil, bukan padam). Servo BUKAN pemutus gas:
+    mematikan api tetap lewat keran/solenoid. Harus ada orang di dekat mesin.</small>
   </div>
 
   <div class="box">
@@ -469,11 +472,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       Pulsa servo: 0&deg; = <input id="sumin" type="text" inputmode="numeric"> &micro;s,
       180&deg; = <input id="sumax" type="text" inputmode="numeric"> &micro;s
       <button onclick="svCalPulse()">Simpan pulsa</button><br>
-      <small>Cara: gerakkan per 1&deg; ke arah menutup sampai gas benar-benar berhenti (api padam, tidak ada aliran),
-      lalu "Simpan sbg TUTUP". Bila di 0&deg; masih bocor, lanjut ke -1&deg;, -2&deg;, ... (sudut negatif = pulsa di bawah
-      pulsa 0&deg;; batas sekitar -18&deg; dgn pulsa default). Berhenti bila servo berdengung/menekan stopper.
-      <b>PERINGATAN:</b> TUTUP = katup RAPAT, api PADAM. Saat PID/servo membuka lagi, gas keluar TANPA api
-      kecuali ada pemantik/pilot yang selalu menyala. Harus ada orang di dekat mesin.</small>
+      <small>Cara: gerakkan per 1&deg; ke arah menutup sampai api sekecil mungkin, lalu "Simpan sbg TUTUP".
+      Bila di 0&deg; masih besar, lanjut ke -1&deg;, -2&deg;, ... (sudut negatif = pulsa di bawah pulsa 0&deg;; batas
+      sekitar -18&deg; dgn pulsa default). Berhenti di sudut terakhir yang servonya masih DIAM; bila berdengung/menekan
+      stopper, naikkan 1&deg;. Api kecil di TUTUP harus tidak mampu menaikkan suhu (uji: minyak panas, TUTUP
+      10 menit, suhu turun/diam). <b>PERINGATAN:</b> servo BUKAN pemutus gas; bila api di TUTUP sampai padam,
+      gas keluar TANPA api saat katup membuka lagi. Harus ada orang di dekat mesin.</small>
     </div>
   </div>
 
@@ -1183,7 +1187,7 @@ void pidDisable(const char* why) {
   bool was = pidOn;
   pidOn = false; pidOut = 0; pidI = 0;
   pidAdaptGains(0.0f, 0.0f);                 // rev 17: gain dipakai kembali = gain dasar
-  setServoAngle((float)svClosedDeg);         // katup ke TUTUP (rev 18: rapat, api padam)
+  setServoAngle((float)svClosedDeg);         // katup ke TUTUP (api minimum hasil kalibrasi)
   if (was && why) { sendMsg(why); buzzPlay(3); }
 }
 
