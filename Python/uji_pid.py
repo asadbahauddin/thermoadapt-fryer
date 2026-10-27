@@ -18,7 +18,7 @@ def c(nama):
 
 
 KP, KI, KD, UMAX = c("PID_DEFAULT_KP"), c("PID_DEFAULT_KI"), c("PID_DEFAULT_KD"), c("PID_DEFAULT_UMAX")
-RAMP, OVER, DF = c("PID_SP_RAMP_C_S"), c("PID_OVER_C"), c("PID_D_FILTER")
+RAMP, HOLD, HYST, DF = c("PID_SP_RAMP_C_S"), c("PID_HOLD_C"), c("PID_HOLD_HYST_C"), c("PID_D_FILTER")
 CUTOFF, FAULT_MS = c("TEMP_CUTOFF_C"), c("SENSOR_FAULT_MS")
 SP_MAX = CUTOFF - 15
 LP, LI, LD = c("PID_DEFAULT_LP"), c("PID_DEFAULT_LI"), c("PID_DEFAULT_LD")
@@ -30,6 +30,7 @@ class Pid:
         self.kp, self.ki, self.kd, self.umax = kp, ki, kd, umax
         self.adapt, self.lp, self.li, self.ld = adapt, lp, li, ld
         self.kpe, self.kie, self.kde = kp, ki, kd
+        self.hold = False
         self.on = False
         self.I = self.out = self.sp_eff = self.prev_t = self.df = 0.0
         self.prev_valid = False
@@ -49,8 +50,9 @@ class Pid:
         self.alasan_mati = why
 
     def enable(self, t, ms, held, setpoint, opening_pct):
-        if math.isnan(t) or held or setpoint > SP_MAX or t >= setpoint + OVER or t >= CUTOFF - 5:
+        if math.isnan(t) or held or setpoint > SP_MAX or t >= CUTOFF - 5:
             return False
+        self.hold = False
         self.sp_eff, self.prev_t, self.df, self.prev_valid = t, t, 0.0, True
         self.gains(0.0, 0.0)
         self.I = min(max(opening_pct, 0.0), self.umax)
@@ -67,7 +69,7 @@ class Pid:
             if now_ms - last_valid_ms > FAULT_MS:
                 self.disable("sensor")
             return
-        if t >= setpoint + OVER or t >= CUTOFF - 5:
+        if t >= CUTOFF:                                  # rev 24: hanya batas AKHIR mematikan
             self.disable("suhu"); return
         if setpoint > SP_MAX:
             self.disable("setpoint"); return
@@ -78,6 +80,15 @@ class Pid:
         stp = RAMP * dt
         self.sp_eff = setpoint if abs(setpoint - self.sp_eff) <= stp else self.sp_eff + (stp if setpoint > self.sp_eff else -stp)
         if held:
+            return
+        if not self.hold and t >= setpoint + HOLD:        # rev 24: overshoot -> tahan TUTUP, tetap ON
+            self.hold = True
+        elif self.hold and t <= setpoint + HOLD - HYST:
+            self.hold = False
+        if self.hold:
+            self.I = self.out = 0.0
+            self.prev_t, self.df = t, 0.0
+            self.gains(self.sp_eff - t, 0.0)
             return
         e = self.sp_eff - t
         if not self.prev_valid:
@@ -133,7 +144,8 @@ class UjiPid(unittest.TestCase):
         self.assertFalse(p.enable(float("nan"), 0, False, 150, 0))
         self.assertFalse(p.enable(100, 0, True, 150, 0))           # HELD
         self.assertFalse(p.enable(100, 0, False, SP_MAX + 1, 0))   # setpoint > 165
-        self.assertFalse(p.enable(170, 0, False, 150, 0))          # sudah >= sp + 15
+        self.assertFalse(p.enable(CUTOFF - 5, 0, False, 150, 0))   # >= batas akhir - 5
+        self.assertTrue(Pid().enable(170, 0, False, 150, 0))       # rev 24: overshoot boleh -> langsung tahan
 
     def test_antiwindup_integral_tidak_lewat_umax(self):
         pid, rows = simulasi(detik=1200)
@@ -172,9 +184,19 @@ class UjiPid(unittest.TestCase):
         self.assertEqual(pid.alasan_mati, "sensor")
         self.assertEqual(mati, 305)                          # 299 s valid terakhir + >5 s
 
-    def test_overtemp_mematikan_pid(self):
+    def test_overshoot_tahan_tetap_on(self):
+        p = Pid(); p.enable(100, 0, False, 150, 30.0)
+        p.update(161.0, 1000, False, 150, 1000, 1000)          # >= sp + 10
+        self.assertTrue(p.on); self.assertTrue(p.hold)
+        self.assertEqual((p.out, p.I), (0.0, 0.0))             # katup TUTUP, integral nol
+        p.update(158.0, 2000, False, 150, 2000, 2000)          # masih > sp + 7: tetap tahan
+        self.assertTrue(p.hold)
+        p.update(157.0, 3000, False, 150, 3000, 3000)          # <= sp + 7: normal lagi
+        self.assertFalse(p.hold); self.assertTrue(p.on)
+
+    def test_batas_akhir_mematikan_pid(self):
         p = Pid(); p.enable(100, 0, False, 150, 0)
-        p.update(165.0, 1000, False, 150, 1000, 1000)
+        p.update(CUTOFF, 1000, False, 150, 1000, 1000)
         self.assertFalse(p.on); self.assertEqual(p.alasan_mati, "suhu")
 
     def test_watchdog(self):
@@ -191,6 +213,10 @@ class UjiPid(unittest.TestCase):
 
 
 class UjiAdaptif(unittest.TestCase):
+    def test_default_ki_tidak_diadaptasi(self):
+        p = Pid(); p.gains(50.0, 0.0)
+        self.assertEqual(LI, 0.0); self.assertEqual(p.kie, KI)
+
     def test_adaptif_off_sama_dengan_pid_biasa(self):
         a = simulasi(detik=1500, pid=Pid(adapt=False))[1]
         b = simulasi(detik=1500, pid=Pid(lp=0, li=0, ld=0))[1]
@@ -198,10 +224,10 @@ class UjiAdaptif(unittest.TestCase):
         self.assertTrue(all(r[6] == KP and r[7] == KI for r in a))
 
     def test_gain_mengikuti_hukum_dan_batas(self):
-        p = Pid()
+        p = Pid(li=0.0005)                                  # default rev 24 lambda_i = 0; uji hukumnya
         p.gains(10.0, 0.2)
         self.assertAlmostEqual(p.kpe, KP + LP * 10)
-        self.assertAlmostEqual(p.kie, KI + LI * 10)
+        self.assertAlmostEqual(p.kie, KI + 0.0005 * 10)
         self.assertAlmostEqual(p.kde, KD + LD * 0.2)
         p.gains(200.0, 50.0)
         self.assertEqual((p.kpe, p.kie, p.kde), (max(KP, KP_MAX), max(KI, KI_MAX), max(KD, KD_MAX)))

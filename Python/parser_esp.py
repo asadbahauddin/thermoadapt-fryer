@@ -3,7 +3,7 @@
 Firmware mengirim 3 jenis pesan JSON:
   temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms, st, te (rev 14), tr, held, ec (rev 15),
                 pe, pu, se (rev 16: PID aktif, keluaran %, setpoint efektif),
-                kpe, kie, kde (rev 17: gain yang SEDANG dipakai, adaptif)
+                kpe, kie, kde (rev 17: gain yang SEDANG dipakai, adaptif), ph (rev 24: tahan overshoot)
                 t = suhu tersaring (rev 21: median-5 -> moving avg-5 -> EMA, + hold), tr = mentah
   st   (4 Hz) : ls[4], raw[4], vr[4], il[4], pn[4], bn, dx, xp, xm, en, sx, ax,
                 sa, sg, sr, sl, um, ux, cd, od, tc, dcc, dct, dcm, dcv, sp,
@@ -30,7 +30,7 @@ KOLOM = (
      "setpoint_c", "error_c",
      # PID (rev 16): kosong bila firmware lama
      # kp/ki/kd = gain yang SEDANG dipakai (berubah tiap sampel saat adaptif); kp0.. = gain dasar
-     "pid_aktif", "pid_output_pct", "setpoint_efektif_c", "kp", "ki", "kd", "pid_umax_pct",
+     "pid_aktif", "pid_tahan", "pid_output_pct", "setpoint_efektif_c", "kp", "ki", "kd", "pid_umax_pct",
      "pid_adaptif", "kp0", "ki0", "kd0", "lambda_p", "lambda_i", "lambda_d",
      "servo_sudut_deg", "servo_target_deg", "servo_bukaan_pct", "servo_target_pct",
      "servo_pulsa_mentah_us", "servo_kunci", "servo_tutup_deg", "servo_buka_deg",
@@ -158,6 +158,7 @@ class Penggabung:
         r["step_test_elapsed_s"] = _bulat(m.get("te"))
         r["pid_aktif"] = _bulat(m.get("pe"))
         r["pid_output_pct"] = _angka(m.get("pu"))
+        r["pid_tahan"] = _bulat(m.get("ph"))              # 1 = overshoot, katup ditahan TUTUP
         r["setpoint_efektif_c"] = _angka(m.get("se"))     # null saat PID mati -> kosong
         r["kp"] = _angka(m.get("kpe"))                    # rev 17: gain yang dipakai sampel ini
         r["ki"] = _angka(m.get("kie"))

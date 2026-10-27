@@ -1,8 +1,16 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 23)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 24)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 24 (dari rev 23):
+ *   - OVERSHOOT tidak lagi mematikan PID: suhu >= setpoint + PID_HOLD_C (10 C) -> katup ditahan
+ *     TUTUP, integral 0, PID tetap ON; normal lagi saat suhu <= setpoint + 7 C. PID MATI hanya
+ *     di batas akhir TEMP_CUTOFF_C (180 C), sensor error, atau STOP. JSON "temp" + "ph" (tahan).
+ *   - Step test web: hasil ditandai TIDAK VALID (gain tidak ditampilkan) bila R^2 < 0.9,
+ *     kenaikan < 10 C, kemiringan tidak konsisten, atau durasi < 3 x dead time.
+ *   - Gain default sementara: Kp 1.46, Ki 0.0054 (Ti 270 dtk), lambda_i 0.
  *
  * REV 23 (dari rev 22):
  *   - Reset LCD otomatis tiap 30 dtk DIMATIKAN (LCD_REINIT_MS 0): pengguna menilai rev 21 lebih
@@ -173,7 +181,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 23"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 24"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
@@ -288,14 +296,17 @@ IPAddress AP_MASK(255, 255, 255, 0);
 static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_FAULT_MS (pengaman sensor)");
 
 // ---- PID SUHU (rev 16) ----
-#define PID_DEFAULT_KP     1.9f      // %bukaan per C   (dari step test: PI konservatif)
-#define PID_DEFAULT_KI     0.056f    // %bukaan per (C*dtk) = Kp/Ti, Ti ~ 34 dtk
+#define PID_DEFAULT_KP     1.46f     // rev 24: PI konservatif step test 28 Okt (Ti 270 dtk). SEMENTARA:
+#define PID_DEFAULT_KI     0.0054f   //   step test itu R^2 0.296 (tidak valid); ulangi step test lebih
+                                     //   besar & lama. Ki lama 0.056 (Ti 34 dtk) terlalu cepat utk L ~80 dtk.
 #define PID_DEFAULT_KD     0.0f      // mulai 0: derivatif memperbesar noise sensor
 #define PID_DEFAULT_UMAX   100.0f    // rev 21: PID boleh memakai seluruh rentang TUTUP(-3)..BUKA(55)
                                      // (40% hanya sampai ~20 derajat). Bisa diturunkan dari web.
 #define PID_SP_RAMP_C_S    0.15f     // laju maks perubahan setpoint efektif (C/dtk) = 9 C/menit
                                      // (simulasi model dugaan: ramp 0.30 -> overshoot ~7 C, 0.15 -> ~4 C)
-#define PID_OVER_C         15.0f     // PID mati bila suhu >= setpoint + ini
+#define PID_HOLD_C         10.0f     // rev 24: suhu >= setpoint + ini -> katup TUTUP, PID TETAP ON
+#define PID_HOLD_HYST_C    3.0f      //   keluar dari tahan bila suhu <= setpoint + HOLD - HYST
+                                     // PID baru MATI total bila suhu >= TEMP_CUTOFF_C (batas akhir)
 #define PID_SP_MAX_C       (TEMP_CUTOFF_C - 15.0f)
 #define PID_D_FILTER       0.8f      // filter derivatif orde-1 (0..1; makin besar makin halus)
 
@@ -314,7 +325,7 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 //   Catatan: gain dasar sendiri Ms 2.9-3.8 bila dead time ternyata ~20 s -> verifikasi step test.
 #define PID_ADAPT_DEFAULT  true
 #define PID_DEFAULT_LP     0.06f     // %/(C*C):  Kp = 1.9 -> 3.0 pada |e| ~ 18 C
-#define PID_DEFAULT_LI     0.0005f   // %/(C*C*dtk)
+#define PID_DEFAULT_LI     0.0f      // rev 24: Ki TIDAK diadaptasi (dead time ~80 dtk: Ki besar = overshoot)
 #define PID_DEFAULT_LD     5.0f      // Kd naik saat suhu berubah cepat (|dT/dt| 1 C/dtk -> +5)
 #define PID_KP_MAX         3.0f
 #define PID_KI_MAX         0.065f
@@ -481,7 +492,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     dibatasi Kp &le; 3, Ki &le; 0,065, Kd &le; 5 (atau nilai dasar bila lebih besar). Kp/Ki/Kd di atas = nilai DASAR.</small><br>
     <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
-    PID mati otomatis + katup TUTUP bila: sensor error &gt;5 dtk, suhu &ge; setpoint+15 &deg;C, atau STOP.
+    Suhu &ge; setpoint+10 &deg;C: katup DITAHAN TUTUP, PID tetap ON (lanjut normal saat turun 3 &deg;C).
+    PID MATI + katup TUTUP bila: sensor error &gt;5 dtk, suhu &ge; 180 &deg;C, atau STOP.
     TUTUP = sudut terkecil hasil kalibrasi (di alat ini masih api kecil, bukan padam). Servo BUKAN pemutus gas:
     mematikan api tetap lewat keran/solenoid. Harus ada orang di dekat mesin.</small>
   </div>
@@ -694,7 +706,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function analyzeStep(){
     const p = stPts, n = p.length;
     if (n < 30) { $('sres').textContent = 'Data terlalu sedikit (<30 detik): tidak bisa dianalisis.'; return; }
-    const W = Math.min(60, Math.floor(n/2));
+    // rev 24: jendela = 1/5 durasi (60..300 dtk). Jendela tetap 60 dtk memilih potongan curam akibat
+    // noise -> kemiringan terlalu besar & dead time salah (uji: L asli 80 dtk terbaca 225 dtk).
+    const W = Math.max(Math.min(60, Math.floor(n/2)), Math.min(300, Math.floor(n/5)));
     let best = null;
     for (let i = 0; i + W <= n; i++) {
       const f = regress(p, i, i + W);
@@ -716,6 +730,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       $('sres').innerHTML = h; return;
     }
     h += 'Dead time L = ' + L.toFixed(1) + ' dtk<br>';
+    // rev 24: uji kelayakan. Hasil tidak layak -> Kp/Ki/Kd TIDAK ditampilkan.
+    const dur = p[n-1][0], alasan = [];
+    if (best.r2 < 0.9) alasan.push('R&sup2; ' + best.r2.toFixed(3) + ' &lt; 0,9 (garis tidak cocok dgn data)');
+    if (rise < 10) alasan.push('kenaikan total ' + rise.toFixed(1) + ' &deg;C &lt; 10 &deg;C (terlalu kecil dibanding noise sensor)');
+    if (best.s * W > Math.max(rise, 0) * 1.5 + 1) alasan.push('kemiringan maks tidak sesuai kenaikan total (noise/lonjakan)');
+    if (dur < 3 * L) alasan.push('durasi ' + dur + ' dtk &lt; 3 &times; dead time (' + (3*L).toFixed(0) + ' dtk)');
+    if (alasan.length) {
+      h += '<div class="err" style="font-weight:700;margin-top:6px">HASIL TIDAK VALID - JANGAN pakai untuk tuning:<br>- '
+        + alasan.join('<br>- ') + '<br>Ulangi: bukaan lebih besar (mis. 30-40%), tahan sampai suhu naik &ge; 20 &deg;C '
+        + '(&ge; 20-40 menit), rekam dgn logger Python.</div>';
+      $('sres').innerHTML = h; return;
+    }
     const kZN = 1.2/(Kp_*L), tiZN = 2*L, tdZN = 0.5*L;
     const kPI = 0.9/(Kp_*L), tiPI = 3.33*L;
     h += '<br><b>Usulan awal (satuan: output % bukaan per &deg;C, waktu dtk)</b><br>'
@@ -816,7 +842,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (data.length > MAXPTS) data.shift();
       if (typeof m.st === 'number') stepFeed(m);
       if (typeof m.pe === 'number') {
-        $('pids').textContent = m.pe ? 'PID AKTIF' : 'PID mati';
+        $('pids').textContent = m.pe ? (m.ph ? 'PID AKTIF - TAHAN (overshoot, katup TUTUP)' : 'PID AKTIF') : 'PID mati';
         $('pids').className = m.pe ? 'ok' : 'err';
         $('pidu').textContent = m.pu.toFixed(1);
         $('pide').textContent = (m.pe && typeof m.se === 'number') ? m.se.toFixed(1) : '--';
@@ -1227,6 +1253,7 @@ float pidOut = 0;                 // keluaran terakhir (persen bukaan, 0..Umax)
 float pidSpEff = 0;               // setpoint efektif (dengan ramp)
 float pidPrevT = 0, pidDf = 0;    // untuk derivatif pada pengukuran
 bool  pidPrevValid = false;       // false setelah sampel NAN: derivatif diinisialisasi ulang
+bool  pidHold = false;            // rev 24: overshoot -> katup ditahan TUTUP, PID tetap ON
 uint32_t pidLastMs = 0;
 
 float servoOpeningPct() {         // bukaan servo sekarang (target) dalam persen TUTUP..BUKA
@@ -1263,7 +1290,8 @@ void pidEnable() {
   if (gSetpoint > PID_SP_MAX_C) {
     char m[64]; snprintf(m, sizeof(m), "PID ditolak: setpoint maks %.0f C", PID_SP_MAX_C); sendMsg(m); return;
   }
-  if (t >= gSetpoint + PID_OVER_C || t >= TEMP_CUTOFF_C - 5.0f) { sendMsg("PID ditolak: suhu sudah terlalu tinggi"); return; }
+  if (t >= TEMP_CUTOFF_C - 5.0f) { sendMsg("PID ditolak: suhu sudah terlalu tinggi"); return; }
+  pidHold = false;
   pidSpEff = t;                               // ramp dimulai dari suhu sekarang
   pidPrevT = t; pidDf = 0; pidPrevValid = true;
   pidAdaptGains(0.0f, 0.0f);                  // gain efektif = gain dasar saat start
@@ -1285,7 +1313,8 @@ void pidUpdate() {
     if (nowMs - gLastValidMs > SENSOR_FAULT_MS) pidDisable("PID MATI: sensor suhu error");
     return;
   }
-  if (T >= gSetpoint + PID_OVER_C || T >= TEMP_CUTOFF_C - 5.0f) { pidDisable("PID MATI: suhu melewati batas"); return; }
+  // rev 24: hanya batas AKHIR yang mematikan PID. Overshoot biasa -> tahan TUTUP (lihat di bawah).
+  if (T >= TEMP_CUTOFF_C) { pidDisable("PID MATI: suhu mencapai batas akhir"); return; }
   if (gSetpoint > PID_SP_MAX_C) { pidDisable("PID MATI: setpoint melewati batas"); return; }
 
   float dt = (float)(s.ms - pidLastMs) / 1000.0f;
@@ -1297,6 +1326,24 @@ void pidUpdate() {
   if (fabsf(tgt - pidSpEff) <= stp) pidSpEff = tgt; else pidSpEff += (tgt > pidSpEff ? stp : -stp);
 
   if (s.held) return;                         // nilai ditahan = bukan pengukuran baru: I & D beku, keluaran tetap
+
+  // rev 24: OVERSHOOT -> katup ditahan TUTUP (api minimum), integral dinolkan, PID TETAP ON.
+  // TUTUP (-3 derajat) = api sangat kecil yang tidak menaikkan suhu, jadi aman ditahan di sini.
+  if (!pidHold && T >= gSetpoint + PID_HOLD_C) {
+    pidHold = true;
+    sendMsg("Overshoot: katup TUTUP sementara, PID tetap ON");
+    buzzPlay(1);
+  } else if (pidHold && T <= gSetpoint + PID_HOLD_C - PID_HOLD_HYST_C) {
+    pidHold = false;
+    sendMsg("Suhu turun: kontrol PID normal lagi");
+  }
+  if (pidHold) {
+    pidI = 0; pidOut = 0;
+    pidPrevT = T; pidDf = 0;
+    pidAdaptGains(pidSpEff - T, 0.0f);
+    setServoAngle((float)svClosedDeg);
+    return;
+  }
 
   float e = pidSpEff - T;
   if (!pidPrevValid) { pidPrevT = T; pidDf = 0; pidPrevValid = true; }   // cegah lonjakan D setelah gangguan
@@ -1565,10 +1612,10 @@ void broadcastTemp() {
   if (pe) snprintf(ses, sizeof(ses), "%.2f", pidSpEff); else strcpy(ses, "null");
   char b[560];
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff);
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff);
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, (int)(pe && pidHold));
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, (int)(pe && pidHold));
   ws.broadcastTXT(b);
 }
 
