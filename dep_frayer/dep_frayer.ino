@@ -1,8 +1,15 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 24)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 25)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 25 (dari rev 24):
+ *   - WebSocket heartbeat (ping 5 dtk, 2x tanpa pong -> putus). Klien mati tidak lagi
+ *     menghabiskan 5 jatah klien library (gejala: halaman tampil tapi "tidak bisa ditekan").
+ *   - Jumlah klien WebSocket tampil di baris diagnosa web ("st": wc, wm).
+ *   - Halaman web diuji di Chrome headless (klik mouse & sentuh HP, ESP tiruan): 55/55 tombol
+ *     mengirim perintah, tanpa error JavaScript, tidak ada elemen yang menutupi tombol.
  *
  * REV 24 (dari rev 23):
  *   - OVERSHOOT tidak lagi mematikan PID: suhu >= setpoint + PID_HOLD_C (10 C) -> katup ditahan
@@ -181,12 +188,15 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 24"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 25"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
                                   // reset manual lewat tombol "Reset LCD" di web. >0 = reset otomatis tiap N ms
 #define WDT_TIMEOUT_S   10        // loop() atau uiTask macet > 10 dtk -> ESP restart
+#define WS_PING_MS          5000  // rev 25: heartbeat WebSocket (buang klien mati)
+#define WS_PONG_TIMEOUT_MS  3000
+#define WS_PONG_MISS        2
                                   // (setelah restart: katup ke TUTUP, PID mati, motor diam)
 
 // ---------------- PIN ----------------
@@ -879,7 +889,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (typeof m.fw === 'string') $('fw').textContent = '(firmware ' + m.fw + ')';
       if (typeof m.rr === 'string')                         // rev 22: diagnosa ketahanan
         $('diag').textContent = 'Boot terakhir: ' + m.rr + ' | heap min ' + m.hp + ' B | sisa stack LCD '
-          + m.sk + ' B | reset LCD ' + m.lr + 'x';
+          + m.sk + ' B | reset LCD ' + m.lr + 'x'
+          + (typeof m.wc === 'number' ? ' | klien WS ' + m.wc + '/' + m.wm : '');
       $('svus').textContent = m.sr ? m.sr : Math.round(m.um + (m.ux - m.um) * m.sa / 180);
       $('svcd').textContent = m.cd; $('svod').textContent = m.od;
       svCd = m.cd; svOd = m.od; svSg = m.sg;
@@ -1579,7 +1590,7 @@ void broadcastStatus() {
     "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f,"
     "\"kp\":%.3f,\"ki\":%.5f,\"kd\":%.3f,\"pm\":%.1f,"           // rev 16: pm = Umax PID (um = pulsa servo); kp/ki/kd = gain DASAR
     "\"ad\":%d,\"lp\":%.4f,\"li\":%.5f,\"ld\":%.3f,"             // rev 17: adaptif ON/OFF + lambda
-    "\"fw\":\"%s\",\"rr\":\"%s\",\"hp\":%lu,\"sk\":%u,\"lr\":%lu}",  // rev 20 versi; rev 22 diagnosa
+    "\"fw\":\"%s\",\"rr\":\"%s\",\"hp\":%lu,\"sk\":%u,\"lr\":%lu,\"wc\":%d,\"wm\":%d}",  // rev 20 versi; rev 22 diagnosa; rev 25 klien WS
     (int)BENCH_MODE, digitalRead(PIN_X_DIR), stepX.currentPosition(), stepX.distanceToGo() != 0,
     driversEnabled, spdX, accX,
     (int)lroundf(svCurDeg), (int)lroundf(svTargetDeg), (int)svRawUs, (int)svLock, svUsMin, svUsMax, svClosedDeg, svOpenDeg, (int)TEMP_CUTOFF_C,
@@ -1587,7 +1598,8 @@ void broadcastStatus() {
     pidKp, pidKi, pidKd, pidUmax,
     (int)pidAdapt, pidLp, pidLi, pidLd, FW_REV,
     gResetWhy, (unsigned long)ESP.getMinFreeHeap(),
-    gUiTask ? (unsigned)uxTaskGetStackHighWaterMark(gUiTask) : 0u, (unsigned long)gLcdResets);
+    gUiTask ? (unsigned)uxTaskGetStackHighWaterMark(gUiTask) : 0u, (unsigned long)gLcdResets,
+    ws.connectedClients(), (int)WEBSOCKETS_SERVER_CLIENT_MAX);
   ws.broadcastTXT(b);
 }
 
@@ -2019,6 +2031,11 @@ void setup() {
   server.begin();
   ws.begin();
   ws.onEvent(onWsEvent);
+  // rev 25: heartbeat. Library WebSockets hanya menampung WEBSOCKETS_SERVER_CLIENT_MAX (5) klien.
+  // Tanpa heartbeat, klien yang mati (tab lama, HP tidur, logger ditutup paksa) tetap menempati
+  // jatah; bila 5 jatah penuh, halaman baru tampil tetapi TIDAK tersambung -> semua tombol
+  // "Belum terhubung". Ping tiap 5 dtk; 2x tanpa pong dlm 3 dtk -> klien diputus (~15 dtk).
+  ws.enableHeartbeat(WS_PING_MS, WS_PONG_TIMEOUT_MS, WS_PONG_MISS);
 
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, NULL, 1, &gUiTask, 0);
   buzzPlay(1);                      // bip pendek saat boot = buzzer hidup
