@@ -1,8 +1,16 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 25)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 26)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 26 (dari rev 25): CEK KEWAJARAN SENSOR
+ *   - Bacaan yang melompat lebih cepat dari SENSOR_MAX_RATE_C_S (5 C/dtk) + margin 2 C dianggap
+ *     BACAAN SALAH (mis. 65 -> 200 C): nilai wajar terakhir ditahan (HELD), PID TETAP HIDUP.
+ *     Bila bertahan > 3 dtk -> NAN; > 5 dtk -> PID mati "sensor error". Kenaikan nyata yang
+ *     bertahap sampai 180 C tetap mematikan PID (batas akhir). Batas lolos melebar seiring waktu
+ *     sejak sampel wajar terakhir (acuan TIDAK dihapus saat masa tahan habis; 65 -> 200 C baru
+ *     diterima setelah ~27 dtk). Bacaan di luar -20..450 C selalu dianggap salah.
  *
  * REV 25 (dari rev 24):
  *   - WebSocket heartbeat (ping 5 dtk, 2x tanpa pong -> putus). Klien mati tidak lagi
@@ -188,7 +196,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 25"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 26"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
@@ -303,6 +311,14 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define SENSOR_PUBLISH_EVERY   5        // kirim ke web/logger & grafik LCD tiap 5 sampel = 1 Hz (seperti sebelumnya)
                                         // (minyak fisik tidak berubah 5 C dalam 200 ms)
 #define SENSOR_HOLD_MS         3000UL   // tahan nilai tersaring terakhir maks selama ini saat error
+// rev 26: CEK KEWAJARAN. Minyak tidak bisa berubah > SENSOR_MAX_RATE_C_S. Bacaan yang melompat lebih
+// jauh dari (margin + laju x waktu sejak sampel wajar terakhir) = BACAAN SALAH (bukan suhu nyata):
+// nilai terakhir DITAHAN dan PID TETAP HIDUP. Bila bacaan salah bertahan > SENSOR_HOLD_MS -> NAN,
+// dan > SENSOR_FAULT_MS -> PID mati "sensor error" (tetap aman). Kenaikan nyata bertahap tetap lolos.
+#define SENSOR_MAX_RATE_C_S    5.0f     // C per detik (pemanasan/ubi masuk jauh di bawah ini)
+#define SENSOR_JUMP_MARGIN_C   2.0f     // toleransi noise + kuantisasi 0.25 C
+#define SENSOR_RANGE_MIN_C    -20.0f    // di luar rentang ini = bacaan salah (mencegah sampah jadi acuan)
+#define SENSOR_RANGE_MAX_C    450.0f
 static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_FAULT_MS (pengaman sensor)");
 
 // ---- PID SUHU (rev 16) ----
@@ -1801,6 +1817,10 @@ struct SensorFilter {
   float    ema = NAN;                                  // tahap 3
   bool     have = false;                               // sudah ada sampel valid sejak reset
   float    lastOut = NAN;                              // keluaran terakhir (yang ditahan saat error)
+  float    lastRaw = NAN;                              // rev 26: bacaan mentah wajar terakhir
+  bool     ref = false;                                // rev 26: lastRaw/lastGoodMs berlaku sebagai acuan.
+                                                       // TIDAK dihapus saat masa tahan habis: batas lompatan
+                                                       // melebar 5 C/dtk x waktu sejak bacaan wajar terakhir.
   uint32_t lastGoodMs = 0;
 
   void reset() { mn = mh = an = ah = 0; ema = NAN; have = false; }
@@ -1834,10 +1854,15 @@ SensorFilter sf;
 float sensorFilterStep(float tv, uint32_t now, bool* held, bool* accepted) {
   *held = false; *accepted = false;
   bool valid = !isnan(tv);
-  if (!valid) gErrCount = gErrCount + 1;
 #if SENSOR_FILTER_ENABLE
+  if (valid && (tv < SENSOR_RANGE_MIN_C || tv > SENSOR_RANGE_MAX_C)) valid = false;   // rev 26: rentang
+  if (valid && sf.ref) {                                         // rev 26: cek kewajaran
+    float allow = SENSOR_JUMP_MARGIN_C + SENSOR_MAX_RATE_C_S * (float)(now - sf.lastGoodMs) / 1000.0f;
+    if (fabsf(tv - sf.lastRaw) > allow) valid = false;           // lompatan mustahil -> bacaan salah
+  }
+  if (!valid) gErrCount = gErrCount + 1;
   if (valid) {
-    sf.have = true; sf.lastGoodMs = now;
+    sf.have = true; sf.ref = true; sf.lastGoodMs = now; sf.lastRaw = tv;
     sf.lastOut = sf.stage3Ema(sf.stage2MovAvg(sf.stage1Median(tv)));
     *accepted = true;
     return sf.lastOut;
@@ -1846,9 +1871,10 @@ float sensorFilterStep(float tv, uint32_t now, bool* held, bool* accepted) {
     *held = true;
     return sf.lastOut;
   }
-  sf.reset();                                                     // lewat batas hold
+  sf.reset();                     // lewat batas hold: filter direset, ACUAN (ref) tetap
   return NAN;
 #else
+  if (!valid) gErrCount = gErrCount + 1;
   *accepted = valid;
   return tv;                                                      // perilaku lama (tanpa filter)
 #endif

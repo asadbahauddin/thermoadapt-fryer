@@ -1,4 +1,4 @@
-"""Uji filter sensor suhu firmware rev 21 (Cascaded Filtering 3 tahap) TANPA hardware:
+"""Uji filter sensor suhu firmware rev 26 (cek kewajaran + Cascaded Filtering 3 tahap) TANPA hardware:
     python uji_filter_sensor.py
 
 - Konstanta (FILT_MED_N, FILT_MA_N, FILT_EMA_ALPHA, SENSOR_HOLD_MS, ...) dibaca dari dep_frayer.ino.
@@ -21,7 +21,10 @@ def c(nama):
 
 
 K = {"med": int(c("FILT_MED_N")), "ma": int(c("FILT_MA_N")), "alpha": c("FILT_EMA_ALPHA"),
-     "hold": c("SENSOR_HOLD_MS"), "fault": c("SENSOR_FAULT_MS"), "sample": c("SENSOR_SAMPLE_MS")}
+     "hold": c("SENSOR_HOLD_MS"), "fault": c("SENSOR_FAULT_MS"), "sample": c("SENSOR_SAMPLE_MS"),
+     "rate": c("SENSOR_MAX_RATE_C_S"), "margin": c("SENSOR_JUMP_MARGIN_C"),
+     "rmin": -float(re.search(r"#define\s+SENSOR_RANGE_MIN_C\s+-([\d.]+)", SRC).group(1)),
+     "rmax": c("SENSOR_RANGE_MAX_C")}
 
 
 class Filter:
@@ -33,6 +36,8 @@ class Filter:
         self.ema = math.nan
         self.have = False
         self.last_out = math.nan
+        self.last_raw = math.nan
+        self.ref = False
         self.last_good_ms = 0
         self.err = 0
 
@@ -60,10 +65,16 @@ class Filter:
 
     def step(self, tv, now):
         valid = not math.isnan(tv)
+        if valid and (tv < K["rmin"] or tv > K["rmax"]):     # rev 26: rentang
+            valid = False
+        if valid and self.ref:                               # rev 26: cek kewajaran
+            allow = K["margin"] + K["rate"] * (now - self.last_good_ms) / 1000.0
+            if abs(tv - self.last_raw) > allow:
+                valid = False
         if not valid:
             self.err += 1
         if valid:
-            self.have, self.last_good_ms = True, now
+            self.have, self.ref, self.last_good_ms, self.last_raw = True, True, now, tv
             self.last_out = self.ema_step(self.movavg(self.median(tv)))
             return self.last_out, False, True
         if self.have and (now - self.last_good_ms) <= K["hold"]:
@@ -150,6 +161,61 @@ class UjiHoldFault(unittest.TestCase):
         out, _, lv, _ = jalankan(s)
         bad = [i for i in range(len(s)) if np.isnan(out[i]) and i * 200 - lv[i] > K["fault"]]
         self.assertEqual(bad[0], 125)                            # sama dgn perilaku tanpa filter
+
+
+class UjiKewajaranDanPid(unittest.TestCase):
+    """Skenario lapangan: setpoint 65 C, bacaan tiba-tiba 200 C. Filter + PID (porting) bersama."""
+
+    def jalankan_pid(self, seri, sp=65.0):
+        import uji_pid as up
+        f, pid = Filter(), up.Pid()
+        last_valid, log = 0, []
+        for i, tv in enumerate(seri):
+            now = int(i * K["sample"])
+            out, held, acc = f.step(tv, now)
+            if acc:
+                last_valid = now
+            if i == 0:
+                pid.enable(out, now, held, sp, 20.0)
+            elif i % 5 == 0:                                     # PID 1 Hz (sampel terkirim)
+                pid.update(out, now, held, sp, now, last_valid)
+            log.append((i, out, held, pid.on, pid.out))
+        return pid, log
+
+    def test_bacaan_200_sesaat_pid_tetap_hidup(self):
+        s = np.full(300, 65.0); s[150:160] = 200.0                # 2 dtk bacaan salah
+        pid, log = self.jalankan_pid(s)
+        self.assertTrue(pid.on)                                    # PID TETAP HIDUP
+        self.assertLess(max(r[1] for r in log), 66.0)              # 200 tidak pernah masuk gTemp
+        self.assertTrue(all(r[2] for r in log[150:160]))           # ditahan (HELD)
+
+    def test_bacaan_200_lama_pid_mati_karena_sensor(self):
+        s = np.full(300, 65.0); s[150:] = 200.0                   # bacaan salah terus-menerus
+        pid, log = self.jalankan_pid(s)
+        self.assertFalse(pid.on)
+        self.assertEqual(pid.alasan_mati, "sensor")                # bukan "suhu": sensor tidak dipercaya
+        self.assertLess(max(r[1] for r in log if not np.isnan(r[1]) and r[0] < 165), 66.0)
+
+    def test_acuan_tidak_hilang_200_baru_diterima_setelah_27_detik(self):
+        s = np.full(400, 65.0); s[150:] = 200.0
+        out, held, _, _ = jalankan(s)
+        pertama = next(i for i in range(150, 400) if not np.isnan(out[i]) and out[i] > 100)
+        self.assertAlmostEqual((pertama - 149) * 0.2, (200 - 65 - K["margin"]) / K["rate"], delta=0.4)
+
+    def test_sampah_saat_boot_tidak_jadi_acuan(self):
+        s = np.r_[[900.0], np.full(50, 65.0)]
+        out, _, _, f = jalankan(s)
+        self.assertEqual(out[1], 65.0); self.assertEqual(f.err, 1)
+
+    def test_kenaikan_nyata_bertahap_tetap_lolos(self):
+        s = 65 + 0.5 * np.arange(1000) * 0.2                       # 0,5 C/dtk (pemanasan cepat)
+        out, held, _, f = jalankan(s)
+        self.assertFalse(held.any()); self.assertEqual(f.err, 0)
+
+    def test_ubi_masuk_suhu_turun_cepat_tetap_lolos(self):
+        s = np.r_[np.full(50, 160.0), 160 - 2.0 * np.arange(1, 26) * 0.2, np.full(50, 150.0)]   # turun 2 C/dtk
+        out, held, _, f = jalankan(s)
+        self.assertFalse(held.any()); self.assertEqual(f.err, 0)
 
 
 if __name__ == "__main__":
