@@ -65,7 +65,7 @@ class Pid:
         self.last_ms = ms
         self.on = True
         if math.isnan(t) or held:
-            self.sp_eff = min(setpoint, SP_MAX)
+            self.sp_eff = setpoint
             self.safe_enter(2)
             return True
         self.sp_eff, self.prev_t, self.prev_valid = t, t, True
@@ -83,8 +83,6 @@ class Pid:
             return
         if t >= CUTOFF:
             self.safe_enter(3); return
-        if setpoint > SP_MAX:
-            self.safe_enter(5); return
         if self.safe:                                    # keluar hanya dgn pengukuran baru yang wajar
             if held:
                 return

@@ -1,8 +1,12 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 28)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 29)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 29 (dari rev 28): SETPOINT BEBAS
+ *   - Setpoint menerima angka berapa pun (web & firmware), tanpa batas 20-165. Pengaman 180 C
+ *     tetap: suhu >= 180 -> TAHAN AMAN (katup TUTUP, PID ON) sampai <= 175. Kode TAHAN 5 dihapus.
  *
  * REV 28 (dari rev 27): PID ON SELALU BISA DINYALAKAN
  *   - Dulu PID ON ditolak bila sensor tidak valid/HELD, suhu >= 175 C, setpoint > 165 C, step test
@@ -209,7 +213,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 28"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 29"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
@@ -346,7 +350,6 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 #define PID_HOLD_C         10.0f     // rev 24: suhu >= setpoint + ini -> katup TUTUP, PID TETAP ON
 #define PID_HOLD_HYST_C    3.0f      //   keluar dari tahan bila suhu <= setpoint + HOLD - HYST
                                      // PID baru MATI total bila suhu >= TEMP_CUTOFF_C (batas akhir)
-#define PID_SP_MAX_C       (TEMP_CUTOFF_C - 15.0f)
 #define PID_D_FILTER       0.8f      // filter derivatif orde-1 (0..1; makin besar makin halus)
 
 // ---- ADAPTIVE PID (rev 17), hukum adaptasi SAMA dgn model Simulink (build_deep_fryer_model.m) ----
@@ -373,9 +376,7 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 // ---- SETPOINT SUHU (rev 12) ----
 // Saat ini HANYA referensi untuk grafik web & logger; belum ada PID yang memakainya.
 #define DEFAULT_SETPOINT_C     160.0f
-#define SETPOINT_MIN_C          20.0f
-#define SETPOINT_MAX_C         PID_SP_MAX_C   // rev 28: = batas PID (165 C); dulu 200 -> setpoint
-                                              // 166-200 diterima web tetapi PID ON ditolak
+// rev 29: setpoint BEBAS (tanpa batas min/maks). Pengaman: TEMP_CUTOFF_C (180 C) -> TAHAN AMAN.
 
 // ---------------- OBJEK ----------------
 Adafruit_MAX31855 thermocouple(PIN_MAX_CS);
@@ -499,11 +500,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div><small><span style="color:#4ade80">&#9473; suhu</span> &nbsp;
       <span style="color:#f59e0b">&#9476; setpoint</span></small></div>
     <div style="margin-top:6px">Setpoint: <b id="spv">--</b> &deg;C &nbsp;
-      <input id="spin" type="text" inputmode="decimal" placeholder="20-165"
+      <input id="spin" type="text" inputmode="decimal" placeholder="mis. 160"
              onkeydown="if(event.key==='Enter')sendSp()">
       <button onclick="sendSp()">Set</button></div>
     <div><small>Cara uji: isi setpoint &rarr; Set &rarr; klik <b>MULAI KONTROL</b> di kotak PID Suhu.</small></div>
-    <small>Setpoint 20-165 &deg;C (dipakai PID dan sebagai referensi grafik).</small>
+    <small>Setpoint bebas. Pengaman tetap: suhu &ge; 180 &deg;C -&gt; katup ditahan TUTUP (PID tetap ON)
+    sampai turun ke 175 &deg;C, jadi minyak tidak dibiarkan melewati &plusmn;180 &deg;C.</small>
   </div>
 
   <div class="box">
@@ -694,7 +696,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
   function sendSp(){
     const v = parseFloat(String($('spin').value).replace(',', '.'));   // "160,5" juga diterima
-    if (!isFinite(v) || v < 20 || v > 165) { $('log').textContent = 'Setpoint harus angka 20-165 C'; return; }
+    if (!isFinite(v)) { $('log').textContent = 'Setpoint harus berupa angka'; return; }   // rev 29: bebas
     send('sp,' + v.toFixed(1));
     clean(['spin']);
     $('log').textContent = 'Mengirim setpoint ' + v.toFixed(1) + ' C...';
@@ -883,7 +885,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (data.length > MAXPTS) data.shift();
       if (typeof m.st === 'number') stepFeed(m);
       if (typeof m.pe === 'number') {
-        const TAHAN = {1:'overshoot', 2:'SENSOR ERROR', 3:'SUHU >= 180 C', 4:'DATA SUHU BERHENTI', 5:'setpoint > batas'};
+        const TAHAN = {1:'overshoot', 2:'SENSOR ERROR', 3:'SUHU >= 180 C', 4:'DATA SUHU BERHENTI'};
         $('pids').textContent = m.pe ? (m.ph ? 'PID AKTIF - TAHAN AMAN (' + (TAHAN[m.ph] || m.ph) + ', katup TUTUP)' : 'PID AKTIF') : 'PID mati';
         $('pids').className = m.pe ? 'ok' : 'err';
         $('pidu').textContent = m.pu.toFixed(1);
@@ -1347,7 +1349,6 @@ void pidEnable() {
   if (pidOn) { sendMsg("PID sudah aktif"); return; }
   if (stState == 1) stepTestEnd(3, "Step test dihentikan: PID dinyalakan");
   svRawUs = 0;                                // keluar dari mode pulsa mentah (bila ada)
-  if (gSetpoint > PID_SP_MAX_C) gSetpoint = PID_SP_MAX_C;   // tidak bisa terjadi lewat web (rev 28)
   TempSnap s = readPubSnap();
   float t = s.t;
   pidHold = false;
@@ -1386,7 +1387,6 @@ void pidUpdate() {
   }
   // rev 27: tidak ada yang mematikan PID otomatis; batas akhir -> TAHAN AMAN
   if (T >= TEMP_CUTOFF_C) { pidSafeEnter(3, "SUHU >= 180 C: katup TUTUP, PID tetap ON"); return; }
-  if (gSetpoint > PID_SP_MAX_C) { pidSafeEnter(5, "Setpoint melewati batas: katup TUTUP, PID tetap ON"); return; }
   if (pidSafeWhy) {                           // keluar dari TAHAN AMAN hanya dgn pengukuran baru yang wajar
     if (s.held) return;
     if (pidSafeWhy == 3 && T > TEMP_CUTOFF_C - 5.0f) { setServoAngle((float)svClosedDeg); return; }
@@ -1609,16 +1609,8 @@ void handleCommand(const char* cmd) {
     char* end = nullptr;
     float spv = strtof(cmd + 3, &end);
     if (end == cmd + 3 || !isfinite(spv)) { sendMsg("Setpoint tidak valid"); return; }
-    if (spv < SETPOINT_MIN_C || spv > SETPOINT_MAX_C) {
-      char m[64];
-      snprintf(m, sizeof(m), "Setpoint ditolak: harus %.0f-%.0f C", SETPOINT_MIN_C, SETPOINT_MAX_C);
-      sendMsg(m); return;
-    }
-    if (pidOn && spv > PID_SP_MAX_C) {
-      char m[64];
-      snprintf(m, sizeof(m), "Setpoint ditolak: PID aktif, maks %.0f C", PID_SP_MAX_C);
-      sendMsg(m); return;
-    }
+    // rev 29: setpoint BEBAS (permintaan pengguna). Pengaman tetap: suhu >= TEMP_CUTOFF_C (180 C)
+    // -> TAHAN AMAN (katup TUTUP) sampai <= 175 C, jadi setpoint > 180 tidak membuat minyak > 180.
     gSetpoint = spv;
     prefs.begin("fryer", false);
     prefs.putFloat("sp", spv);
@@ -2046,7 +2038,7 @@ void setup() {
   if (pidLambdaOk(lp, li, ld)) { pidLp = lp; pidLi = li; pidLd = ld; }
   pidAdapt = pad;
   pidAdaptGains(0.0f, 0.0f);
-  gSetpoint = (isfinite(spSaved) && spSaved >= SETPOINT_MIN_C && spSaved <= SETPOINT_MAX_C)
+  gSetpoint = isfinite(spSaved)                                          // rev 29: setpoint bebas
               ? spSaved : DEFAULT_SETPOINT_C;
   // rev 18: kalibrasi TUTUP/BUKA & pulsa diambil dari flash (rev 13 sempat dipaku 0/55);
   // nilai rusak/tidak wajar -> default.

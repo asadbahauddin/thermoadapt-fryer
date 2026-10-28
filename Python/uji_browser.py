@@ -33,7 +33,7 @@ DITERIMA = []
 ST = {"type":"st","ls":[0,0,0,0],"raw":[1,1,1,1],"vr":[1,1,1,1],"il":[1,1,1,1],"pn":[17,35,39,34],
       "bn":0,"dx":0,"xp":0,"xm":0,"en":0,"sx":3000,"ax":3000,"sa":-3,"sg":-3,"sr":0,"sl":0,"um":500,"ux":2500,
       "cd":-3,"od":55,"tc":180,"dcc":0,"dct":0,"dcm":50,"dcv":24,"sp":160.0,"kp":1.46,"ki":0.0054,"kd":0.0,
-      "pm":100.0,"ad":1,"lp":0.06,"li":0.0,"ld":5.0,"fw":"rev 28","rr":"POWER_ON","hp":180000,"sk":3000,"lr":0,"wc":1,"wm":5}
+      "pm":100.0,"ad":1,"lp":0.06,"li":0.0,"ld":5.0,"fw":"rev 29","rr":"POWER_ON","hp":180000,"sk":3000,"lr":0,"wc":1,"wm":5}
 def temp(seq):
     return {"type":"temp","t":150.25,"ok":True,"raw":"09640000","d":"frame valid","up":seq,"sp":160.0,
             "seq":seq,"ms":seq*1000,"st":0,"te":0,"tr":150.3,"held":0,"ec":0,"pe":0,"pu":0.0,"se":None,
