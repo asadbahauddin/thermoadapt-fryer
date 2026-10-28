@@ -21,6 +21,7 @@ KP, KI, KD, UMAX = c("PID_DEFAULT_KP"), c("PID_DEFAULT_KI"), c("PID_DEFAULT_KD")
 RAMP, HOLD, HYST, DF = c("PID_SP_RAMP_C_S"), c("PID_HOLD_C"), c("PID_HOLD_HYST_C"), c("PID_D_FILTER")
 CUTOFF, FAULT_MS = c("TEMP_CUTOFF_C"), c("SENSOR_FAULT_MS")
 SP_MAX = CUTOFF - 15
+CUTOFF_ON = bool(int(re.search(r"#define\s+PID_CUTOFF_ENABLE\s+(\d)", SRC).group(1)))   # rev 30
 LP, LI, LD = c("PID_DEFAULT_LP"), c("PID_DEFAULT_LI"), c("PID_DEFAULT_LD")
 KP_MAX, KI_MAX, KD_MAX = c("PID_KP_MAX"), c("PID_KI_MAX"), c("PID_KD_MAX")
 
@@ -69,7 +70,7 @@ class Pid:
             self.safe_enter(2)
             return True
         self.sp_eff, self.prev_t, self.prev_valid = t, t, True
-        if t >= CUTOFF:
+        if CUTOFF_ON and t >= CUTOFF:
             self.safe_enter(3)
         return True
 
@@ -81,7 +82,7 @@ class Pid:
             if now_ms - last_valid_ms > FAULT_MS:
                 self.safe_enter(2)                       # rev 27: TAHAN AMAN, tetap ON
             return
-        if t >= CUTOFF:
+        if CUTOFF_ON and t >= CUTOFF:
             self.safe_enter(3); return
         if self.safe:                                    # keluar hanya dgn pengukuran baru yang wajar
             if held:
@@ -157,7 +158,7 @@ class UjiPid(unittest.TestCase):
         self.assertAlmostEqual(p.out, 25.0 + (KP + LP * RAMP) * RAMP, places=6)   # Kp efektif (adaptif)
 
     def test_enable_selalu_berhasil(self):                       # rev 28
-        for t, held, harapan in ((float("nan"), False, 2), (100, True, 2), (CUTOFF + 20, False, 3),
+        for t, held, harapan in ((float("nan"), False, 2), (100, True, 2), (CUTOFF + 20, False, 3 if CUTOFF_ON else 0),
                                  (CUTOFF - 5, False, 0), (170, False, 0), (100, False, 0)):
             p = Pid()
             self.assertTrue(p.enable(t, 0, held, 150, 30.0))
@@ -221,14 +222,12 @@ class UjiPid(unittest.TestCase):
         p.update(157.0, 3000, False, 150, 3000, 3000)          # <= sp + 7: normal lagi
         self.assertFalse(p.hold); self.assertTrue(p.on)
 
-    def test_batas_akhir_tahan_aman_tetap_on(self):
-        p = Pid(); p.enable(100, 0, False, 150, 30.0)
-        p.update(CUTOFF, 1000, False, 150, 1000, 1000)
-        self.assertTrue(p.on); self.assertEqual((p.safe, p.out), (3, 0.0))
-        p.update(CUTOFF - 3, 2000, False, 150, 2000, 2000)     # > 175: tetap tahan
-        self.assertEqual(p.safe, 3)
-        p.update(CUTOFF - 5, 3000, False, 150, 3000, 3000)     # <= 175: lanjut
-        self.assertEqual(p.safe, 0); self.assertTrue(p.on)
+    def test_tanpa_batas_suhu_rev30(self):
+        self.assertFalse(CUTOFF_ON)                                  # PID_CUTOFF_ENABLE 0
+        p = Pid(); p.enable(CUTOFF + 20, 0, False, 250, 30.0)        # PID ON saat 200 C, setpoint 250
+        p.update(CUTOFF + 20, 1000, False, 250, 1000, 1000)
+        self.assertTrue(p.on); self.assertEqual(p.safe, 0)
+        self.assertGreater(p.out, 0.0)                               # tetap memanaskan menuju setpoint
 
     def test_hanya_pengguna_yang_mematikan(self):
         p = Pid(); p.enable(100, 0, False, 150, 0)

@@ -196,11 +196,12 @@ class UjiKewajaranDanPid(unittest.TestCase):
         self.assertTrue(pid.on)                                    # rev 27: PID tidak pernah mati otomatis
         self.assertEqual((pid.safe, pid.out), (2, 0.0))            # TAHAN AMAN karena SENSOR, katup TUTUP
         self.assertLess(max(r[1] for r in log if not np.isnan(r[1]) and r[0] < 165), 66.0)
-        # > ~27 dtk: angka 200 secara fisik mungkin -> diterima -> suhu >= 180 (kode 3), tetap ON & TUTUP
+        # > ~27 dtk: angka 200 secara fisik mungkin -> diterima. rev 30 (tanpa batas suhu): 200 >= sp + 10
+        # -> TAHAN overshoot (katup TUTUP), PID tetap ON
         s = np.full(400, 65.0); s[150:] = 200.0
         pid, _ = self.jalankan_pid(s)
         self.assertTrue(pid.on)
-        self.assertEqual((pid.safe, pid.out), (3, 0.0))
+        self.assertEqual((pid.safe, pid.hold, pid.out), (0, True, 0.0))
 
     def test_acuan_tidak_hilang_200_baru_diterima_setelah_27_detik(self):
         s = np.full(400, 65.0); s[150:] = 200.0

@@ -1,8 +1,14 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 29)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 30)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 30 (dari rev 29): PENGAMAN 180 C DINONAKTIFKAN (keputusan pengguna, ada E-stop fisik)
+ *   - PID_CUTOFF_ENABLE 0: tidak ada batas suhu otomatis di PID (kode tetap ada; ganti ke 1 untuk
+ *     mengaktifkan lagi). TAHAN untuk sensor error / data berhenti / overshoot tetap ada.
+ *   - Web: setpoint > 200 C minta konfirmasi (penangkal salah ketik, bukan batas).
+ *   - Simulasi rev 29: tanpa batas, setpoint tinggi benar-benar dikejar; E-stop wajib memutus gas.
  *
  * REV 29 (dari rev 28): SETPOINT BEBAS
  *   - Setpoint menerima angka berapa pun (web & firmware), tanpa batas 20-165. Pengaman 180 C
@@ -213,7 +219,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 29"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 30"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
@@ -321,6 +327,9 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define SERVO_SAFETY           false    // true: paksa katup ke sudut TUTUP bila sensor error/suhu lewat batas
 #define SENSOR_FAULT_MS        5000UL
 #define TEMP_CUTOFF_C          180.0f   // NILAI AWAL: cek titik asap minyak
+#define PID_CUTOFF_ENABLE      0        // rev 30: 0 = PID TANPA batas suhu (keputusan pengguna: ada E-stop
+                                        // fisik). 1 = suhu >= TEMP_CUTOFF_C -> TAHAN AMAN (katup TUTUP).
+                                        // E-stop HARUS memutus GAS (solenoid/keran), bukan hanya listrik.
 
 // ---- PENANGANAN SENSOR SUHU (rev 15) ----
 #define SENSOR_FILTER_ENABLE   1        // 0 = perilaku lama: gTemp = bacaan mentah (tanpa filter cascade/hold)
@@ -504,8 +513,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
              onkeydown="if(event.key==='Enter')sendSp()">
       <button onclick="sendSp()">Set</button></div>
     <div><small>Cara uji: isi setpoint &rarr; Set &rarr; klik <b>MULAI KONTROL</b> di kotak PID Suhu.</small></div>
-    <small>Setpoint bebas. Pengaman tetap: suhu &ge; 180 &deg;C -&gt; katup ditahan TUTUP (PID tetap ON)
-    sampai turun ke 175 &deg;C, jadi minyak tidak dibiarkan melewati &plusmn;180 &deg;C.</small>
+    <small>Setpoint bebas, TANPA batas suhu otomatis (pakai E-stop bila perlu). Setpoint &gt; 200 &deg;C
+    minta konfirmasi untuk mencegah salah ketik.</small>
   </div>
 
   <div class="box">
@@ -534,9 +543,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     dibatasi Kp &le; 3, Ki &le; 0,065, Kd &le; 5 (atau nilai dasar bila lebih besar). Kp/Ki/Kd di atas = nilai DASAR.</small><br>
     <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
-    PID hanya MATI bila Anda menekan PID OFF / STOP. Kondisi bahaya -> TAHAN AMAN: katup TUTUP, PID tetap ON,
-    lanjut sendiri saat normal: suhu &ge; setpoint+10 &deg;C (lanjut di +7), sensor error &gt;5 dtk,
-    suhu &ge; 180 &deg;C (lanjut di 175), data suhu berhenti.
+    PID hanya MATI bila Anda menekan PID OFF / STOP. TAHAN (katup TUTUP, PID tetap ON, lanjut sendiri):
+    suhu &ge; setpoint+10 &deg;C (lanjut di +7), sensor error &gt;5 dtk, data suhu berhenti.
+    Tidak ada batas suhu otomatis: gunakan E-stop (harus memutus gas).
     TUTUP = sudut terkecil hasil kalibrasi (di alat ini masih api kecil, bukan padam). Servo BUKAN pemutus gas:
     mematikan api tetap lewat keran/solenoid. Harus ada orang di dekat mesin.</small>
   </div>
@@ -697,6 +706,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function sendSp(){
     const v = parseFloat(String($('spin').value).replace(',', '.'));   // "160,5" juga diterima
     if (!isFinite(v)) { $('log').textContent = 'Setpoint harus berupa angka'; return; }   // rev 29: bebas
+    // rev 30: bukan batas, hanya penangkal salah ketik (mis. 1600 untuk 160)
+    if (v > 200 && !confirm('Setpoint ' + v + ' C (di atas 200 C). Yakin? Tidak ada batas suhu otomatis.')) return;
     send('sp,' + v.toFixed(1));
     clean(['spin']);
     $('log').textContent = 'Mengirim setpoint ' + v.toFixed(1) + ' C...';
@@ -1366,10 +1377,12 @@ void pidEnable() {
   }
   pidSpEff = t;                               // ramp dimulai dari suhu sekarang
   pidPrevT = t; pidPrevValid = true;
+#if PID_CUTOFF_ENABLE
   if (t >= TEMP_CUTOFF_C) {
     pidSafeEnter(3, "PID AKTIF - TAHAN AMAN: suhu >= 180 C, katup TUTUP");
     return;
   }
+#endif
   sendMsg("PID AKTIF");
 }
 
@@ -1385,8 +1398,10 @@ void pidUpdate() {
       pidSafeEnter(2, "SENSOR ERROR: katup TUTUP, PID tetap ON (lanjut saat sensor normal)");
     return;
   }
-  // rev 27: tidak ada yang mematikan PID otomatis; batas akhir -> TAHAN AMAN
+  // rev 27: tidak ada yang mematikan PID otomatis. rev 30: batas suhu hanya bila PID_CUTOFF_ENABLE 1
+#if PID_CUTOFF_ENABLE
   if (T >= TEMP_CUTOFF_C) { pidSafeEnter(3, "SUHU >= 180 C: katup TUTUP, PID tetap ON"); return; }
+#endif
   if (pidSafeWhy) {                           // keluar dari TAHAN AMAN hanya dgn pengukuran baru yang wajar
     if (s.held) return;
     if (pidSafeWhy == 3 && T > TEMP_CUTOFF_C - 5.0f) { setServoAngle((float)svClosedDeg); return; }
