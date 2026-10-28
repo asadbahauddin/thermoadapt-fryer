@@ -55,17 +55,22 @@ class Pid:
         self.on, self.out, self.I = False, 0.0, 0.0
         self.alasan_mati = why
 
-    def enable(self, t, ms, held, setpoint, opening_pct):
-        if math.isnan(t) or held or setpoint > SP_MAX or t >= CUTOFF - 5:
-            return False
+    def enable(self, t, ms, held, setpoint, opening_pct):   # rev 28: SELALU berhasil
         self.hold = False
         self.safe = 0
-        self.sp_eff, self.prev_t, self.df, self.prev_valid = t, t, 0.0, True
         self.gains(0.0, 0.0)
         self.I = min(max(opening_pct, 0.0), self.umax)
         self.out = self.I
+        self.df = 0.0
         self.last_ms = ms
         self.on = True
+        if math.isnan(t) or held:
+            self.sp_eff = min(setpoint, SP_MAX)
+            self.safe_enter(2)
+            return True
+        self.sp_eff, self.prev_t, self.prev_valid = t, t, True
+        if t >= CUTOFF:
+            self.safe_enter(3)
         return True
 
     def update(self, t, ms, held, setpoint, now_ms, last_valid_ms):
@@ -153,13 +158,22 @@ class UjiPid(unittest.TestCase):
         # e = sp_eff - T = 0.15 -> keluaran hampir sama dengan bukaan saat start (25%)
         self.assertAlmostEqual(p.out, 25.0 + (KP + LP * RAMP) * RAMP, places=6)   # Kp efektif (adaptif)
 
-    def test_enable_ditolak(self):
-        p = Pid()
-        self.assertFalse(p.enable(float("nan"), 0, False, 150, 0))
-        self.assertFalse(p.enable(100, 0, True, 150, 0))           # HELD
-        self.assertFalse(p.enable(100, 0, False, SP_MAX + 1, 0))   # setpoint > 165
-        self.assertFalse(p.enable(CUTOFF - 5, 0, False, 150, 0))   # >= batas akhir - 5
-        self.assertTrue(Pid().enable(170, 0, False, 150, 0))       # rev 24: overshoot boleh -> langsung tahan
+    def test_enable_selalu_berhasil(self):                       # rev 28
+        for t, held, harapan in ((float("nan"), False, 2), (100, True, 2), (CUTOFF + 20, False, 3),
+                                 (CUTOFF - 5, False, 0), (170, False, 0), (100, False, 0)):
+            p = Pid()
+            self.assertTrue(p.enable(t, 0, held, 150, 30.0))
+            self.assertTrue(p.on)
+            self.assertEqual(p.safe, harapan, (t, held))
+            if harapan:
+                self.assertEqual(p.out, 0.0)                         # katup TUTUP saat tahan aman
+
+    def test_enable_saat_sensor_error_lalu_sensor_pulih(self):
+        p = Pid(); p.enable(float("nan"), 0, False, 150, 30.0)
+        self.assertEqual(p.safe, 2)
+        p.update(100.0, 1000, False, 150, 1000, 1000)                # bacaan wajar datang
+        self.assertEqual(p.safe, 0); self.assertTrue(p.on)
+        self.assertEqual(p.sp_eff, 100.0)                            # ramp mulai dari suhu sekarang
 
     def test_antiwindup_integral_tidak_lewat_umax(self):
         pid, rows = simulasi(detik=1200)

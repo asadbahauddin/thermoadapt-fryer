@@ -1,8 +1,15 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 27)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 28)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 28 (dari rev 27): PID ON SELALU BISA DINYALAKAN
+ *   - Dulu PID ON ditolak bila sensor tidak valid/HELD, suhu >= 175 C, setpoint > 165 C, step test
+ *     berjalan, atau servo terkunci. Sekarang PID ON selalu berhasil; kondisi tidak aman ->
+ *     langsung TAHAN AMAN (katup TUTUP) dan berjalan sendiri saat normal. Step test yang berjalan
+ *     dihentikan otomatis.
+ *   - Setpoint maks = 165 C di web & firmware (dulu web menerima sampai 200 tetapi PID menolak).
  *
  * REV 27 (dari rev 26): PID TIDAK PERNAH MATI OTOMATIS (permintaan pengguna)
  *   - PID hanya mati lewat PID OFF / STOP. Sensor error > 5 dtk, suhu >= 180 C, data suhu berhenti,
@@ -202,7 +209,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 27"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 28"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
@@ -367,7 +374,8 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 // Saat ini HANYA referensi untuk grafik web & logger; belum ada PID yang memakainya.
 #define DEFAULT_SETPOINT_C     160.0f
 #define SETPOINT_MIN_C          20.0f
-#define SETPOINT_MAX_C         200.0f
+#define SETPOINT_MAX_C         PID_SP_MAX_C   // rev 28: = batas PID (165 C); dulu 200 -> setpoint
+                                              // 166-200 diterima web tetapi PID ON ditolak
 
 // ---------------- OBJEK ----------------
 Adafruit_MAX31855 thermocouple(PIN_MAX_CS);
@@ -491,11 +499,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div><small><span style="color:#4ade80">&#9473; suhu</span> &nbsp;
       <span style="color:#f59e0b">&#9476; setpoint</span></small></div>
     <div style="margin-top:6px">Setpoint: <b id="spv">--</b> &deg;C &nbsp;
-      <input id="spin" type="text" inputmode="decimal" placeholder="mis. 160"
+      <input id="spin" type="text" inputmode="decimal" placeholder="20-165"
              onkeydown="if(event.key==='Enter')sendSp()">
       <button onclick="sendSp()">Set</button></div>
     <div><small>Cara uji: isi setpoint &rarr; Set &rarr; klik <b>MULAI KONTROL</b> di kotak PID Suhu.</small></div>
-    <small>Setpoint dipakai PID (maks 165 &deg;C saat PID aktif) dan sebagai referensi grafik.</small>
+    <small>Setpoint 20-165 &deg;C (dipakai PID dan sebagai referensi grafik).</small>
   </div>
 
   <div class="box">
@@ -686,7 +694,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
   function sendSp(){
     const v = parseFloat(String($('spin').value).replace(',', '.'));   // "160,5" juga diterima
-    if (!isFinite(v) || v < 20 || v > 200) { $('log').textContent = 'Setpoint harus angka 20-200 C'; return; }
+    if (!isFinite(v) || v < 20 || v > 165) { $('log').textContent = 'Setpoint harus angka 20-165 C'; return; }
     send('sp,' + v.toFixed(1));
     clean(['spin']);
     $('log').textContent = 'Mengirim setpoint ' + v.toFixed(1) + ' C...';
@@ -1332,27 +1340,35 @@ void pidAdaptGains(float e, float dTdt) {
   pidKdEff = fminf(pidKd + pidLd * fabsf(dTdt), fmaxf(pidKd, PID_KD_MAX));
 }
 
+// rev 28: PID ON SELALU berhasil (dulu ditolak 7 syarat: sensor tidak valid/HELD, suhu >= 175,
+// setpoint > 165, step test, servo terkunci). Kondisi yang tidak aman -> langsung TAHAN AMAN
+// (katup TUTUP, PID tetap ON) dan berjalan sendiri saat normal, sama seperti rev 27.
 void pidEnable() {
+  if (pidOn) { sendMsg("PID sudah aktif"); return; }
+  if (stState == 1) stepTestEnd(3, "Step test dihentikan: PID dinyalakan");
+  svRawUs = 0;                                // keluar dari mode pulsa mentah (bila ada)
+  if (gSetpoint > PID_SP_MAX_C) gSetpoint = PID_SP_MAX_C;   // tidak bisa terjadi lewat web (rev 28)
   TempSnap s = readPubSnap();
   float t = s.t;
-  if (pidOn) { sendMsg("PID sudah aktif"); return; }
-  if (stState == 1)       { sendMsg("PID ditolak: step test berjalan"); return; }
-  if (isnan(t))           { sendMsg("PID ditolak: sensor suhu tidak valid"); return; }
-  if (s.held)             { sendMsg("PID ditolak: sensor sedang error sesaat (HELD)"); return; }
-  if (svLock || svRawUs > 0) { sendMsg("PID ditolak: servo terkunci/mode pulsa"); return; }
-  if (gSetpoint > PID_SP_MAX_C) {
-    char m[64]; snprintf(m, sizeof(m), "PID ditolak: setpoint maks %.0f C", PID_SP_MAX_C); sendMsg(m); return;
-  }
-  if (t >= TEMP_CUTOFF_C - 5.0f) { sendMsg("PID ditolak: suhu sudah terlalu tinggi"); return; }
   pidHold = false;
   pidSafeWhy = 0;
-  pidSpEff = t;                               // ramp dimulai dari suhu sekarang
-  pidPrevT = t; pidDf = 0; pidPrevValid = true;
   pidAdaptGains(0.0f, 0.0f);                  // gain efektif = gain dasar saat start
   pidI = constrain(servoOpeningPct(), 0.0f, pidUmax);   // start tanpa loncatan (e = 0 saat start)
   pidOut = pidI;
+  pidDf = 0;
   pidLastMs = s.ms;
   pidOn = true;
+  if (isnan(t) || s.held) {                   // sensor belum bisa dipercaya: tunggu, katup TUTUP
+    pidSpEff = gSetpoint;
+    pidSafeEnter(2, "PID AKTIF - TAHAN AMAN: sensor belum valid, katup TUTUP");
+    return;
+  }
+  pidSpEff = t;                               // ramp dimulai dari suhu sekarang
+  pidPrevT = t; pidPrevValid = true;
+  if (t >= TEMP_CUTOFF_C) {
+    pidSafeEnter(3, "PID AKTIF - TAHAN AMAN: suhu >= 180 C, katup TUTUP");
+    return;
+  }
   sendMsg("PID AKTIF");
 }
 
