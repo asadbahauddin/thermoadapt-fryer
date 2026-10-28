@@ -24,7 +24,7 @@ K = {"med": int(c("FILT_MED_N")), "ma": int(c("FILT_MA_N")), "alpha": c("FILT_EM
      "hold": c("SENSOR_HOLD_MS"), "fault": c("SENSOR_FAULT_MS"), "sample": c("SENSOR_SAMPLE_MS"),
      "rate": c("SENSOR_MAX_RATE_C_S"), "margin": c("SENSOR_JUMP_MARGIN_C"),
      "rmin": -float(re.search(r"#define\s+SENSOR_RANGE_MIN_C\s+-([\d.]+)", SRC).group(1)),
-     "rmax": c("SENSOR_RANGE_MAX_C")}
+     "rmax": c("SENSOR_RANGE_MAX_C"), "refn": int(c("SENSOR_REF_N"))}
 
 
 class Filter:
@@ -38,6 +38,7 @@ class Filter:
         self.last_out = math.nan
         self.last_raw = math.nan
         self.ref = False
+        self.cand, self.cand_n = math.nan, 0
         self.last_good_ms = 0
         self.err = 0
 
@@ -67,6 +68,11 @@ class Filter:
         valid = not math.isnan(tv)
         if valid and (tv < K["rmin"] or tv > K["rmax"]):     # rev 26: rentang
             valid = False
+        if valid and not self.ref:                           # rev 32: acuan dari 3 sampel konsisten
+            self.cand_n = self.cand_n + 1 if (self.cand_n and abs(tv - self.cand) <= K["margin"]) else 1
+            self.cand = tv
+            if self.cand_n < K["refn"]:
+                return math.nan, False, False
         if valid and self.ref:                               # rev 26: cek kewajaran
             allow = K["margin"] + K["rate"] * (now - self.last_good_ms) / 1000.0
             if abs(tv - self.last_raw) > allow:
@@ -108,13 +114,13 @@ class UjiStatis(unittest.TestCase):
 class UjiSifatFilter(unittest.TestCase):
     def test_sinyal_konstan_tidak_berubah(self):
         out, _, _, _ = jalankan([150.0] * 50)
-        np.testing.assert_allclose(out, 150.0)
+        np.testing.assert_allclose(out[2:], 150.0)               # 2 sampel awal: menunggu acuan (rev 32)
 
     def test_lonjakan_1_dan_2_sampel_dibuang(self):
         for n in (1, 2):
             s = np.full(60, 100.0); s[30:30 + n] = 140.0
             out, _, _, _ = jalankan(s)
-            self.assertLess(np.max(np.abs(out - 100.0)), 1e-9, n)
+            self.assertLess(np.max(np.abs(out[2:] - 100.0)), 1e-9, n)
 
     def test_jeda_rampa_sekitar_1_3_detik(self):
         s = 30 + 0.5 * np.arange(400) * K["sample"] / 1000
@@ -131,13 +137,14 @@ class UjiSifatFilter(unittest.TestCase):
     def test_loncatan_tanpa_overshoot(self):
         s = np.r_[np.full(20, 100.0), np.full(80, 110.0)]
         out, _, _, _ = jalankan(s)
-        self.assertLessEqual(out.max(), 110.0 + 1e-9)
-        self.assertTrue(np.all(np.diff(out) >= -1e-12))
+        self.assertLessEqual(np.nanmax(out), 110.0 + 1e-9)
+        self.assertTrue(np.all(np.diff(out[2:]) >= -1e-12))
 
-    def test_awal_data_langsung_ada_nilai(self):
-        out, _, _, _ = jalankan([150.0, 151.0, 152.0])
-        self.assertFalse(np.isnan(out).any())
-        self.assertEqual(out[0], 150.0)
+    def test_awal_data_tunggu_3_sampel_konsisten(self):          # rev 32
+        out, _, _, f = jalankan([150.0, 150.25, 150.5, 150.75])
+        self.assertTrue(np.isnan(out[:2]).all())                 # 2 sampel pertama: belum ada acuan
+        self.assertEqual(out[2], 150.5)                          # sampel ke-3 konsisten -> mulai
+        self.assertEqual(f.err, 0)                               # menunggu acuan bukan error
 
 
 class UjiHoldFault(unittest.TestCase):
@@ -186,7 +193,7 @@ class UjiKewajaranDanPid(unittest.TestCase):
         s = np.full(300, 65.0); s[150:160] = 200.0                # 2 dtk bacaan salah
         pid, log = self.jalankan_pid(s)
         self.assertTrue(pid.on)                                    # PID TETAP HIDUP
-        self.assertLess(max(r[1] for r in log), 66.0)              # 200 tidak pernah masuk gTemp
+        self.assertLess(np.nanmax([r[1] for r in log]), 66.0)      # 200 tidak pernah masuk gTemp
         self.assertTrue(all(r[2] for r in log[150:160]))           # ditahan (HELD)
 
     def test_bacaan_200_lama_pid_tetap_on_tahan_aman_sensor(self):
@@ -212,7 +219,13 @@ class UjiKewajaranDanPid(unittest.TestCase):
     def test_sampah_saat_boot_tidak_jadi_acuan(self):
         s = np.r_[[900.0], np.full(50, 65.0)]
         out, _, _, f = jalankan(s)
-        self.assertEqual(out[1], 65.0); self.assertEqual(f.err, 1)
+        self.assertEqual(out[3], 65.0); self.assertEqual(f.err, 1)  # 900 di luar rentang
+
+    def test_200_rusak_saat_boot_tidak_jadi_acuan(self):          # rev 32: dulu jadi acuan ~27 dtk
+        s = np.r_[[200.0], np.full(50, 65.0)]
+        out, _, _, _ = jalankan(s)
+        self.assertTrue(np.nanmax(out) < 66.0)                    # 200 tidak pernah keluar
+        self.assertEqual(out[3], 65.0)
 
     def test_kenaikan_nyata_bertahap_tetap_lolos(self):
         s = 65 + 0.5 * np.arange(1000) * 0.2                       # 0,5 C/dtk (pemanasan cepat)

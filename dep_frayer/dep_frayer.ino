@@ -1,8 +1,15 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 31)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 32)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 32 (dari rev 31): PEMBACAAN MAX31855 DIPERKUAT (analisis bacaan 200 C)
+ *   - Tiap sampel: frame dibaca 2x berturut-turut; berbeda = data rusak di SPI -> ditolak.
+ *   - Dekode sendiri dgn validasi datasheet (D16, D17, D3, 0x0/0xFFFFFFFF, cold junction -20..85 C).
+ *     Library readCelsius() hanya cek D2..D0: frame rusak lolos sbg suhu "sah", 0x00000000 = 0 C.
+ *   - Acuan cek kewajaran baru sah setelah 3 sampel konsisten (dulu 1: sampel rusak bisa jadi acuan).
+ *   - Penghitung per jenis error + suhu chip di web (JSON "st": nf, nb, nm, nc, nj, cj) & logger.
  *
  * REV 31 (dari rev 30):
  *   - LCD DIMATIKAN (LCD_ENABLE 0): tidak diinisialisasi/digambar; bus SPI hanya untuk MAX31855.
@@ -225,7 +232,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 31"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 32"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -355,6 +362,7 @@ IPAddress AP_MASK(255, 255, 255, 0);
 // dan > SENSOR_FAULT_MS -> PID mati "sensor error" (tetap aman). Kenaikan nyata bertahap tetap lolos.
 #define SENSOR_MAX_RATE_C_S    5.0f     // C per detik (pemanasan/ubi masuk jauh di bawah ini)
 #define SENSOR_JUMP_MARGIN_C   2.0f     // toleransi noise + kuantisasi 0.25 C
+#define SENSOR_REF_N           3        // rev 32: acuan baru sah setelah 3 sampel berturut-turut konsisten
 #define SENSOR_RANGE_MIN_C    -20.0f    // di luar rentang ini = bacaan salah (mencegah sampah jadi acuan)
 #define SENSOR_RANGE_MAX_C    450.0f
 static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_FAULT_MS (pengaman sensor)");
@@ -423,6 +431,13 @@ volatile float gSetpoint = DEFAULT_SETPOINT_C;
 volatile float gTempRaw = NAN;               // bacaan mentah MAX31855 terakhir (NAN bila fault)
 volatile bool  gTempHeld = false;            // true: gTemp = nilai ditahan (sensor error sesaat)
 volatile uint32_t gErrCount = 0;             // jumlah sampel tidak valid (fault/lonjakan) sejak boot
+// rev 32: penghitung per jenis (sejak boot) -> menunjukkan SUMBER masalah di web & logger
+volatile uint32_t gCntFault = 0;             // fault termokopel dari MAX31855 (open/short GND/short VCC)
+volatile uint32_t gCntFrame = 0;             // frame tidak sah (0x00000000, 0xFFFFFFFF, bit D17/D3 = 1)
+volatile uint32_t gCntMismatch = 0;          // 2 pembacaan berturut-turut BERBEDA = data rusak di kabel SPI
+volatile uint32_t gCntCj = 0;                // suhu cold junction (chip) di luar -20..85 C = frame rusak
+volatile uint32_t gCntJump = 0;              // lompatan suhu mustahil (cek kewajaran rev 26)
+volatile float    gCjTemp = NAN;             // suhu cold junction (suhu chip MAX31855), C
 volatile bool  pidOn = false;                // PID suhu aktif (rev 16)
 volatile bool  gUiForce = false;             // rev 22: paksa gambar ulang semua elemen LCD
 volatile uint32_t gLcdResets = 0;            // rev 22: jumlah reset LCD sejak boot
@@ -463,6 +478,25 @@ uint32_t maxReadRaw() {
   digitalWrite(PIN_MAX_CS, HIGH);
   SPI.endTransaction();
   return v;
+}
+
+// rev 32: dekode SATU frame MAX31855 dgn validasi lengkap (datasheet): D16 = fault, D17 & D3 selalu 0,
+// D2..D0 = jenis fault, D31..D18 suhu termokopel (14 bit, 0.25 C), D15..D4 cold junction (12 bit,
+// 0.0625 C). Library Adafruit readCelsius() hanya memeriksa D2..D0, sehingga frame rusak lolos
+// sebagai suhu "sah" (mis. 200 C) dan 0x00000000 terbaca 0 C.
+// Kode *code: 0 ok | 1/2/4 fault termokopel | 0x10 frame tidak sah | 0x40 cold junction tidak wajar
+float maxDecode(uint32_t v, uint8_t* code) {
+  *code = 0;
+  if (v == 0x00000000UL || v == 0xFFFFFFFFUL || (v & 0x00020008UL)) { *code = 0x10; return NAN; }
+  if (v & 0x00010000UL) { *code = (v & 0x7) ? (uint8_t)(v & 0x7) : 0x10; return NAN; }
+  int16_t cj = (int16_t)((v >> 4) & 0x0FFF);
+  if (cj & 0x0800) cj -= 0x1000;
+  float cjC = cj * 0.0625f;
+  gCjTemp = cjC;
+  if (cjC < -20.0f || cjC > 85.0f) { *code = 0x40; return NAN; }
+  int32_t t = (int32_t)((v >> 18) & 0x3FFF);
+  if (t & 0x2000) t -= 0x4000;
+  return t * 0.25f;
 }
 
 const char* rawDiag(uint32_t v) {
@@ -902,7 +936,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         data.push({t: m.t, sp: sp});
       } else {
         $('temp').innerHTML='ERR';
-        $('status').textContent='SENSOR ERROR: ' + ({1:'thermocouple LEPAS (open circuit)',2:'short ke GND',4:'short ke VCC'}[m.f] || 'tidak ada data (cek SCK/CS/SO & VCC 3V3)'); $('status').className='err'; data.push({t: null, sp: sp});
+        $('status').textContent='SENSOR ERROR: ' + ({1:'thermocouple LEPAS (open circuit)',2:'short ke GND',4:'short ke VCC',16:'frame data rusak (cek kabel SPI)',32:'data berubah saat dibaca (gangguan kabel SPI)',64:'suhu chip tidak wajar (frame rusak)'}[m.f] || 'tidak ada data (cek SCK/CS/SO & VCC 3V3)'); $('status').className='err'; data.push({t: null, sp: sp});
       }
       if (data.length > MAXPTS) data.shift();
       if (typeof m.st === 'number') stepFeed(m);
@@ -946,7 +980,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (typeof m.rr === 'string')                         // rev 22: diagnosa ketahanan
         $('diag').textContent = 'Boot terakhir: ' + m.rr + ' | heap min ' + m.hp + ' B | sisa stack LCD '
           + m.sk + ' B | reset LCD ' + m.lr + 'x'
-          + (typeof m.wc === 'number' ? ' | klien WS ' + m.wc + '/' + m.wm : '');
+          + (typeof m.wc === 'number' ? ' | klien WS ' + m.wc + '/' + m.wm : '')
+          + (typeof m.nf === 'number' ? ' || SENSOR sejak boot: fault TC ' + m.nf + ', frame rusak ' + m.nb
+             + ', baca-2x beda ' + m.nm + ', CJ aneh ' + m.nc + ', lompatan ' + m.nj
+             + ' | suhu chip ' + (m.cj > -90 ? m.cj.toFixed(1) + ' C' : '-') : '');
       $('svus').textContent = m.sr ? m.sr : Math.round(m.um + (m.ux - m.um) * m.sa / 180);
       $('svcd').textContent = m.cd; $('svod').textContent = m.od;
       svCd = m.cd; svOd = m.od; svSg = m.sg;
@@ -1678,7 +1715,8 @@ void broadcastStatus() {
     "\"dcc\":%d,\"dct\":%d,\"dcm\":%d,\"dcv\":%d,\"sp\":%.1f,"
     "\"kp\":%.3f,\"ki\":%.5f,\"kd\":%.3f,\"pm\":%.1f,"           // rev 16: pm = Umax PID (um = pulsa servo); kp/ki/kd = gain DASAR
     "\"ad\":%d,\"lp\":%.4f,\"li\":%.5f,\"ld\":%.3f,"             // rev 17: adaptif ON/OFF + lambda
-    "\"fw\":\"%s\",\"rr\":\"%s\",\"hp\":%lu,\"sk\":%u,\"lr\":%lu,\"wc\":%d,\"wm\":%d}",  // rev 20 versi; rev 22 diagnosa; rev 25 klien WS
+    "\"fw\":\"%s\",\"rr\":\"%s\",\"hp\":%lu,\"sk\":%u,\"lr\":%lu,\"wc\":%d,\"wm\":%d,"
+    "\"nf\":%lu,\"nb\":%lu,\"nm\":%lu,\"nc\":%lu,\"nj\":%lu,\"cj\":%.2f}",          // rev 32: penghitung error sensor  // rev 20 versi; rev 22 diagnosa; rev 25 klien WS
     (int)BENCH_MODE, digitalRead(PIN_X_DIR), stepX.currentPosition(), stepX.distanceToGo() != 0,
     driversEnabled, spdX, accX,
     (int)lroundf(svCurDeg), (int)lroundf(svTargetDeg), (int)svRawUs, (int)svLock, svUsMin, svUsMax, svClosedDeg, svOpenDeg, (int)TEMP_CUTOFF_C,
@@ -1687,7 +1725,9 @@ void broadcastStatus() {
     (int)pidAdapt, pidLp, pidLi, pidLd, FW_REV,
     gResetWhy, (unsigned long)ESP.getMinFreeHeap(),
     gUiTask ? (unsigned)uxTaskGetStackHighWaterMark(gUiTask) : 0u, (unsigned long)gLcdResets,
-    ws.connectedClients(), (int)WEBSOCKETS_SERVER_CLIENT_MAX);
+    ws.connectedClients(), (int)WEBSOCKETS_SERVER_CLIENT_MAX,
+    (unsigned long)gCntFault, (unsigned long)gCntFrame, (unsigned long)gCntMismatch, (unsigned long)gCntCj,
+    (unsigned long)gCntJump, isnan(gCjTemp) ? -99.0f : (float)gCjTemp);
   ws.broadcastTXT(b);
 }
 
@@ -1810,7 +1850,8 @@ void uiUpdate() {
   float t = gTemp;
   if (isnan(t)) {
     putText(fTemp, "ERR", 10, 34, 6, TFT_RED, 250);
-    const char* why = (gFault & 1) ? "thermocouple LEPAS" : (gFault & 2) ? "short ke GND" : (gFault & 4) ? "short ke VCC" : "tdk ada data";
+    const char* why = (gFault & 1) ? "thermocouple LEPAS" : (gFault & 2) ? "short ke GND" : (gFault & 4) ? "short ke VCC"
+                    : (gFault == 0x20) ? "SPI terganggu" : (gFault == 0x10 || gFault == 0x40) ? "frame rusak" : "tdk ada data";
     snprintf(b, sizeof(b), "ERR %08lX %s", (unsigned long)gRaw, gRaw == 0 ? "SO=LOW" : (gRaw == 0xFFFFFFFFUL ? "SO=HIGH" : why));
     putText(fSens, b, 10, 86, 2, TFT_RED, 470);
   } else {
@@ -1890,6 +1931,7 @@ struct SensorFilter {
   bool     have = false;                               // sudah ada sampel valid sejak reset
   float    lastOut = NAN;                              // keluaran terakhir (yang ditahan saat error)
   float    lastRaw = NAN;                              // rev 26: bacaan mentah wajar terakhir
+  float    cand = NAN;  uint8_t candN = 0;             // rev 32: calon acuan (perlu SENSOR_REF_N sampel)
   bool     ref = false;                                // rev 26: lastRaw/lastGoodMs berlaku sebagai acuan.
                                                        // TIDAK dihapus saat masa tahan habis: batas lompatan
                                                        // melebar 5 C/dtk x waktu sejak bacaan wajar terakhir.
@@ -1928,9 +1970,14 @@ float sensorFilterStep(float tv, uint32_t now, bool* held, bool* accepted) {
   bool valid = !isnan(tv);
 #if SENSOR_FILTER_ENABLE
   if (valid && (tv < SENSOR_RANGE_MIN_C || tv > SENSOR_RANGE_MAX_C)) valid = false;   // rev 26: rentang
+  if (valid && !sf.ref) {                                        // rev 32: acuan dari 3 sampel konsisten
+    if (sf.candN && fabsf(tv - sf.cand) <= SENSOR_JUMP_MARGIN_C) sf.candN++; else sf.candN = 1;
+    sf.cand = tv;
+    if (sf.candN < SENSOR_REF_N) return NAN;                     // belum ada acuan: tunggu (bukan error)
+  }
   if (valid && sf.ref) {                                         // rev 26: cek kewajaran
     float allow = SENSOR_JUMP_MARGIN_C + SENSOR_MAX_RATE_C_S * (float)(now - sf.lastGoodMs) / 1000.0f;
-    if (fabsf(tv - sf.lastRaw) > allow) valid = false;           // lompatan mustahil -> bacaan salah
+    if (fabsf(tv - sf.lastRaw) > allow) { valid = false; gCntJump = gCntJump + 1; }   // lompatan mustahil
   }
   if (!valid) gErrCount = gErrCount + 1;
   if (valid) {
@@ -2014,9 +2061,21 @@ void uiTask(void*) {
 #endif
     if (sensorReady && (first || now - lastTemp >= SENSOR_SAMPLE_MS)) {
       first = false; lastTemp = now;
-      gRaw = maxReadRaw();
-      float tv = thermocouple.readCelsius();          // NAN kalau fault
-      uint8_t f = isnan(tv) ? thermocouple.readError() : 0;
+      // rev 32: BACA DUA KALI berturut-turut. Register MAX31855 hanya berubah di akhir konversi
+      // (70-100 ms), jadi dua pembacaan dalam beberapa mikrodetik HARUS identik; berbeda = data
+      // rusak di kabel SPI (simulasi: nilai salah yang lolos turun ~1000x). Dekode sendiri satu
+      // frame (suhu, fault, data mentah konsisten) - readCelsius()/readError() tidak dipakai lagi.
+      uint32_t ra = maxReadRaw(), rb = maxReadRaw();
+      gRaw = ra;
+      uint8_t f = 0;
+      float tv = NAN;
+      if (ra != rb) { f = 0x20; gCntMismatch = gCntMismatch + 1; }
+      else {
+        tv = maxDecode(ra, &f);
+        if (f & 0x07)      gCntFault = gCntFault + 1;
+        else if (f == 0x10) gCntFrame = gCntFrame + 1;
+        else if (f == 0x40) gCntCj = gCntCj + 1;
+      }
       bool held, accepted;
       float out = sensorFilterStep(tv, now, &held, &accepted);
       gFault = f;

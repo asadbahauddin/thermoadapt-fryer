@@ -25,6 +25,8 @@ KOLOM = (
      "suhu_c", "sensor_ok", "fault_kode", "max31855_raw", "max31855_diag",
      # suhu_c = tersaring firmware (rev 21: cascade 3 tahap); mentah, flag ditahan, jumlah error sejak boot
      "suhu_mentah_c", "suhu_ditahan", "sensor_error_total",
+     # rev 32: penghitung error sensor sejak boot (sumber masalah) + suhu chip MAX31855
+     "err_fault_tc", "err_frame_rusak", "err_baca_beda", "err_cj", "err_lompatan", "suhu_chip_c",
      # rev 14: status step test di firmware (0 siap, 1 berjalan, 2 selesai, 3 berhenti) + detik berjalan
      "step_test_status", "step_test_elapsed_s",
      "setpoint_c", "error_c",
@@ -194,6 +196,13 @@ class Penggabung:
                 r["ls_%s_kena" % n] = None if kini is None else max(kini, self.ls_kena_interval[i])
                 r["ls_%s_raw" % n] = _bit(s.get("raw"), i)
             r["bench_mode"] = _angka(s.get("bn"))
+            r["err_fault_tc"] = _bulat(s.get("nf"))
+            r["err_frame_rusak"] = _bulat(s.get("nb"))
+            r["err_baca_beda"] = _bulat(s.get("nm"))
+            r["err_cj"] = _bulat(s.get("nc"))
+            r["err_lompatan"] = _bulat(s.get("nj"))
+            cj = _angka(s.get("cj"))
+            r["suhu_chip_c"] = cj if (cj is not None and cj > -90) else None
             r["kp0"] = _angka(s.get("kp"))                    # gain DASAR (rev 17)
             r["ki0"] = _angka(s.get("ki"))
             r["kd0"] = _angka(s.get("kd"))

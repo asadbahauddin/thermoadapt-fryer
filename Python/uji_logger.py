@@ -113,7 +113,11 @@ class UjiParser(unittest.TestCase):
         self.assertEqual((r["kp"], r["ki"], r["kd"]), (1.954, 0.05645, 0.25))       # gain DIPAKAI
         self.assertEqual((r["kp0"], r["ki0"], r["kd0"]), (1.9, 0.056, 0.0))         # gain dasar
         self.assertEqual((r["pid_adaptif"], r["lambda_p"], r["lambda_i"], r["lambda_d"]), (1, 0.06, 0.0005, 5.0))
+        g.status_masuk(parse(ST_REV17.replace('"ld":5.000}', '"ld":5.000,"nf":2,"nb":5,"nm":17,"nc":0,"nj":3,"cj":31.25}')), 0.1)
         r = g.baris_dari_temp(parse(TEMP_REV17.replace('"kde":0.2500}', '"kde":0.2500,"ph":1}')), 0.2, "x", 1)
+        self.assertEqual((r["err_fault_tc"], r["err_frame_rusak"], r["err_baca_beda"], r["err_cj"], r["err_lompatan"]),
+                         (2, 5, 17, 0, 3))
+        self.assertEqual(r["suhu_chip_c"], 31.25)
         self.assertEqual(r["pid_tahan"], 1)
 
     def test_firmware_lama_tanpa_sp(self):
