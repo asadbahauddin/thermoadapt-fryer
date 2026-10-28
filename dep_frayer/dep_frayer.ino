@@ -1,8 +1,14 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 26)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 27)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 27 (dari rev 26): PID TIDAK PERNAH MATI OTOMATIS (permintaan pengguna)
+ *   - PID hanya mati lewat PID OFF / STOP. Sensor error > 5 dtk, suhu >= 180 C, data suhu berhenti,
+ *     setpoint > batas, dan overshoot -> TAHAN AMAN: katup TUTUP (api minimum), integral 0, PID
+ *     tetap ON, lanjut sendiri saat kondisi normal (180 C: lanjut di <= 175 C). JSON "ph" = kode.
+ *   - Setelah ESP restart PID tetap OFF (sengaja: api tidak menyala sendiri tanpa orang).
  *
  * REV 26 (dari rev 25): CEK KEWAJARAN SENSOR
  *   - Bacaan yang melompat lebih cepat dari SENSOR_MAX_RATE_C_S (5 C/dtk) + margin 2 C dianggap
@@ -196,7 +202,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 26"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 27"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
@@ -518,8 +524,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     dibatasi Kp &le; 3, Ki &le; 0,065, Kd &le; 5 (atau nilai dasar bila lebih besar). Kp/Ki/Kd di atas = nilai DASAR.</small><br>
     <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
-    Suhu &ge; setpoint+10 &deg;C: katup DITAHAN TUTUP, PID tetap ON (lanjut normal saat turun 3 &deg;C).
-    PID MATI + katup TUTUP bila: sensor error &gt;5 dtk, suhu &ge; 180 &deg;C, atau STOP.
+    PID hanya MATI bila Anda menekan PID OFF / STOP. Kondisi bahaya -> TAHAN AMAN: katup TUTUP, PID tetap ON,
+    lanjut sendiri saat normal: suhu &ge; setpoint+10 &deg;C (lanjut di +7), sensor error &gt;5 dtk,
+    suhu &ge; 180 &deg;C (lanjut di 175), data suhu berhenti.
     TUTUP = sudut terkecil hasil kalibrasi (di alat ini masih api kecil, bukan padam). Servo BUKAN pemutus gas:
     mematikan api tetap lewat keran/solenoid. Harus ada orang di dekat mesin.</small>
   </div>
@@ -868,7 +875,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (data.length > MAXPTS) data.shift();
       if (typeof m.st === 'number') stepFeed(m);
       if (typeof m.pe === 'number') {
-        $('pids').textContent = m.pe ? (m.ph ? 'PID AKTIF - TAHAN (overshoot, katup TUTUP)' : 'PID AKTIF') : 'PID mati';
+        const TAHAN = {1:'overshoot', 2:'SENSOR ERROR', 3:'SUHU >= 180 C', 4:'DATA SUHU BERHENTI', 5:'setpoint > batas'};
+        $('pids').textContent = m.pe ? (m.ph ? 'PID AKTIF - TAHAN AMAN (' + (TAHAN[m.ph] || m.ph) + ', katup TUTUP)' : 'PID AKTIF') : 'PID mati';
         $('pids').className = m.pe ? 'ok' : 'err';
         $('pidu').textContent = m.pu.toFixed(1);
         $('pide').textContent = (m.pe && typeof m.se === 'number') ? m.se.toFixed(1) : '--';
@@ -1281,6 +1289,10 @@ float pidSpEff = 0;               // setpoint efektif (dengan ramp)
 float pidPrevT = 0, pidDf = 0;    // untuk derivatif pada pengukuran
 bool  pidPrevValid = false;       // false setelah sampel NAN: derivatif diinisialisasi ulang
 bool  pidHold = false;            // rev 24: overshoot -> katup ditahan TUTUP, PID tetap ON
+// rev 27: PID HANYA dimatikan pengguna (PID OFF / STOP). Kondisi bahaya -> TAHAN AMAN: katup TUTUP,
+// integral 0, PID TETAP ON, lanjut sendiri saat kondisi normal. Kode (JSON "ph"):
+//   1 overshoot (>= sp + 10)   2 sensor error > 5 dtk   3 suhu >= 180 C   4 data suhu berhenti   5 setpoint > batas
+uint8_t pidSafeWhy = 0;
 uint32_t pidLastMs = 0;
 
 float servoOpeningPct() {         // bukaan servo sekarang (target) dalam persen TUTUP..BUKA
@@ -1296,6 +1308,20 @@ void pidDisable(const char* why) {
   pidAdaptGains(0.0f, 0.0f);                 // rev 17: gain dipakai kembali = gain dasar
   setServoAngle((float)svClosedDeg);         // katup ke TUTUP (api minimum hasil kalibrasi)
   if (was && why) { sendMsg(why); buzzPlay(3); }
+}
+
+// rev 27: TAHAN AMAN (pengganti pidDisable otomatis). Pesan & buzzer hanya saat masuk/ganti alasan.
+void pidSafeEnter(uint8_t why, const char* msg) {
+  if (pidSafeWhy != why) { pidSafeWhy = why; sendMsg(msg); buzzPlay(3); }
+  pidI = 0; pidOut = 0; pidPrevValid = false;
+  setServoAngle((float)svClosedDeg);         // katup TUTUP (api minimum)
+}
+
+void pidSafeExit(float T, uint32_t ms) {
+  pidSafeWhy = 0;
+  pidSpEff = T;                              // setpoint efektif mulai lagi dari suhu sekarang (tanpa loncatan)
+  pidLastMs = ms;
+  sendMsg("Kondisi normal: kontrol PID lanjut");
 }
 
 // rev 17: hukum adaptasi (lihat blok ADAPTIVE PID di konfigurasi). Adaptif OFF -> gain dasar.
@@ -1319,6 +1345,7 @@ void pidEnable() {
   }
   if (t >= TEMP_CUTOFF_C - 5.0f) { sendMsg("PID ditolak: suhu sudah terlalu tinggi"); return; }
   pidHold = false;
+  pidSafeWhy = 0;
   pidSpEff = t;                               // ramp dimulai dari suhu sekarang
   pidPrevT = t; pidDf = 0; pidPrevValid = true;
   pidAdaptGains(0.0f, 0.0f);                  // gain efektif = gain dasar saat start
@@ -1335,14 +1362,21 @@ void pidUpdate() {
   TempSnap s = readPubSnap();
   float T = s.t;
   uint32_t nowMs = millis();
-  if (isnan(T)) {                             // sampel buruk: tahan keluaran; mati bila terlalu lama
+  if (isnan(T)) {                             // sampel buruk: tahan keluaran; TAHAN AMAN bila terlalu lama
     pidPrevValid = false;
-    if (nowMs - gLastValidMs > SENSOR_FAULT_MS) pidDisable("PID MATI: sensor suhu error");
+    if (nowMs - gLastValidMs > SENSOR_FAULT_MS)
+      pidSafeEnter(2, "SENSOR ERROR: katup TUTUP, PID tetap ON (lanjut saat sensor normal)");
     return;
   }
-  // rev 24: hanya batas AKHIR yang mematikan PID. Overshoot biasa -> tahan TUTUP (lihat di bawah).
-  if (T >= TEMP_CUTOFF_C) { pidDisable("PID MATI: suhu mencapai batas akhir"); return; }
-  if (gSetpoint > PID_SP_MAX_C) { pidDisable("PID MATI: setpoint melewati batas"); return; }
+  // rev 27: tidak ada yang mematikan PID otomatis; batas akhir -> TAHAN AMAN
+  if (T >= TEMP_CUTOFF_C) { pidSafeEnter(3, "SUHU >= 180 C: katup TUTUP, PID tetap ON"); return; }
+  if (gSetpoint > PID_SP_MAX_C) { pidSafeEnter(5, "Setpoint melewati batas: katup TUTUP, PID tetap ON"); return; }
+  if (pidSafeWhy) {                           // keluar dari TAHAN AMAN hanya dgn pengukuran baru yang wajar
+    if (s.held) return;
+    if (pidSafeWhy == 3 && T > TEMP_CUTOFF_C - 5.0f) { setServoAngle((float)svClosedDeg); return; }
+    pidSafeExit(T, s.ms);
+    return;
+  }
 
   float dt = (float)(s.ms - pidLastMs) / 1000.0f;
   pidLastMs = s.ms;
@@ -1391,7 +1425,8 @@ void pidUpdate() {
 void pidWatchdog() {
   if (!pidOn) return;
   TempSnap s = readPubSnap();
-  if (millis() - s.ms > SENSOR_FAULT_MS) pidDisable("PID MATI: data suhu berhenti (uiTask macet?)");
+  if (millis() - s.ms > SENSOR_FAULT_MS)          // rev 27: TAHAN AMAN, PID tetap ON
+    pidSafeEnter(4, "DATA SUHU BERHENTI: katup TUTUP, PID tetap ON");
 }
 
 void pidSave() {
@@ -1641,9 +1676,9 @@ void broadcastTemp() {
   char b[560];
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
   if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, (int)(pe && pidHold));
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0);
   else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, (int)(pe && pidHold));
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0);
   ws.broadcastTXT(b);
 }
 

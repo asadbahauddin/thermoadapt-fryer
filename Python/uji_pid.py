@@ -31,6 +31,7 @@ class Pid:
         self.adapt, self.lp, self.li, self.ld = adapt, lp, li, ld
         self.kpe, self.kie, self.kde = kp, ki, kd
         self.hold = False
+        self.safe = 0                                    # rev 27: kode TAHAN AMAN (0 = normal)
         self.on = False
         self.I = self.out = self.sp_eff = self.prev_t = self.df = 0.0
         self.prev_valid = False
@@ -45,6 +46,11 @@ class Pid:
         self.kie = min(self.ki + self.li * abs(e), max(self.ki, KI_MAX))
         self.kde = min(self.kd + self.ld * abs(dTdt), max(self.kd, KD_MAX))
 
+    def safe_enter(self, why):                           # rev 27: pidSafeEnter
+        self.safe = why
+        self.I = self.out = 0.0
+        self.prev_valid = False
+
     def disable(self, why):
         self.on, self.out, self.I = False, 0.0, 0.0
         self.alasan_mati = why
@@ -53,6 +59,7 @@ class Pid:
         if math.isnan(t) or held or setpoint > SP_MAX or t >= CUTOFF - 5:
             return False
         self.hold = False
+        self.safe = 0
         self.sp_eff, self.prev_t, self.df, self.prev_valid = t, t, 0.0, True
         self.gains(0.0, 0.0)
         self.I = min(max(opening_pct, 0.0), self.umax)
@@ -67,12 +74,19 @@ class Pid:
         if math.isnan(t):
             self.prev_valid = False
             if now_ms - last_valid_ms > FAULT_MS:
-                self.disable("sensor")
+                self.safe_enter(2)                       # rev 27: TAHAN AMAN, tetap ON
             return
-        if t >= CUTOFF:                                  # rev 24: hanya batas AKHIR mematikan
-            self.disable("suhu"); return
+        if t >= CUTOFF:
+            self.safe_enter(3); return
         if setpoint > SP_MAX:
-            self.disable("setpoint"); return
+            self.safe_enter(5); return
+        if self.safe:                                    # keluar hanya dgn pengukuran baru yang wajar
+            if held:
+                return
+            if self.safe == 3 and t > CUTOFF - 5:
+                return
+            self.safe, self.sp_eff, self.last_ms = 0, t, ms
+            return
         dt = (ms - self.last_ms) / 1000.0
         self.last_ms = ms
         if dt < 0.05 or dt > 5.0:
@@ -106,7 +120,7 @@ class Pid:
 
     def watchdog(self, now_ms, pub_ms):
         if self.on and now_ms - pub_ms > FAULT_MS:
-            self.disable("watchdog")
+            self.safe_enter(4)                           # rev 27: TAHAN AMAN, tetap ON
 
 
 def simulasi(detik=3600, sp=150.0, K=4.0, tau=600.0, L=20.0, T0=30.0, ganggu=None, pid=None, beban=None):
@@ -175,14 +189,15 @@ class UjiPid(unittest.TestCase):
         self.assertEqual(I[400], I[399]); self.assertEqual(I[402], I[399])
         self.assertEqual(out[402], out[399])
 
-    def test_sensor_nan_lama_mematikan_pid(self):
+    def test_sensor_error_tahan_aman_tetap_on_lalu_lanjut(self):
         def g(i, T):
-            return (float("nan"), False) if i >= 300 else (T, False)
-        pid, rows = simulasi(detik=320, ganggu=g)
-        mati = next(r[0] for r in rows if not r[5])
-        self.assertFalse(pid.on)
-        self.assertEqual(pid.alasan_mati, "sensor")
-        self.assertEqual(mati, 305)                          # 299 s valid terakhir + >5 s
+            return (float("nan"), False) if 300 <= i < 330 else (T, False)
+        pid, rows = simulasi(detik=400, ganggu=g)
+        self.assertTrue(all(r[5] for r in rows))            # PID TIDAK PERNAH mati
+        out = {r[0]: r[2] for r in rows}
+        self.assertTrue(all(out[i] == 0.0 for i in range(305, 330)))   # > 5 dtk: katup TUTUP
+        self.assertEqual(pid.safe, 0)                       # sensor normal -> lanjut sendiri
+        self.assertGreater(max(out[i] for i in range(331, 400)), 0.0)
 
     def test_overshoot_tahan_tetap_on(self):
         p = Pid(); p.enable(100, 0, False, 150, 30.0)
@@ -194,15 +209,29 @@ class UjiPid(unittest.TestCase):
         p.update(157.0, 3000, False, 150, 3000, 3000)          # <= sp + 7: normal lagi
         self.assertFalse(p.hold); self.assertTrue(p.on)
 
-    def test_batas_akhir_mematikan_pid(self):
-        p = Pid(); p.enable(100, 0, False, 150, 0)
+    def test_batas_akhir_tahan_aman_tetap_on(self):
+        p = Pid(); p.enable(100, 0, False, 150, 30.0)
         p.update(CUTOFF, 1000, False, 150, 1000, 1000)
-        self.assertFalse(p.on); self.assertEqual(p.alasan_mati, "suhu")
+        self.assertTrue(p.on); self.assertEqual((p.safe, p.out), (3, 0.0))
+        p.update(CUTOFF - 3, 2000, False, 150, 2000, 2000)     # > 175: tetap tahan
+        self.assertEqual(p.safe, 3)
+        p.update(CUTOFF - 5, 3000, False, 150, 3000, 3000)     # <= 175: lanjut
+        self.assertEqual(p.safe, 0); self.assertTrue(p.on)
 
-    def test_watchdog(self):
+    def test_hanya_pengguna_yang_mematikan(self):
         p = Pid(); p.enable(100, 0, False, 150, 0)
-        p.watchdog(5000, 0); self.assertTrue(p.on)
-        p.watchdog(5001, 0); self.assertFalse(p.on); self.assertEqual(p.alasan_mati, "watchdog")
+        for t in (float("nan"), 500.0, 170.0, 60.0):
+            p.update(t, 10_000, False, 150, 10_000, 0)
+        p.watchdog(99_999, 0)
+        self.assertTrue(p.on)
+        p.disable("pengguna"); self.assertFalse(p.on)
+
+    def test_watchdog_tahan_aman(self):
+        p = Pid(); p.enable(100, 0, False, 150, 30.0)
+        p.watchdog(5000, 0); self.assertEqual(p.safe, 0)
+        p.watchdog(5001, 0); self.assertTrue(p.on); self.assertEqual((p.safe, p.out), (4, 0.0))
+        p.update(100.0, 6000, False, 150, 6000, 6000)          # data masuk lagi -> lanjut
+        self.assertEqual(p.safe, 0)
 
     def test_derivatif_tanpa_lonjakan_setelah_gangguan(self):
         p = Pid(kd=10.0); p.enable(100, 0, False, 150, 0)

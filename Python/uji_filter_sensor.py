@@ -189,12 +189,18 @@ class UjiKewajaranDanPid(unittest.TestCase):
         self.assertLess(max(r[1] for r in log), 66.0)              # 200 tidak pernah masuk gTemp
         self.assertTrue(all(r[2] for r in log[150:160]))           # ditahan (HELD)
 
-    def test_bacaan_200_lama_pid_mati_karena_sensor(self):
-        s = np.full(300, 65.0); s[150:] = 200.0                   # bacaan salah terus-menerus
+    def test_bacaan_200_lama_pid_tetap_on_tahan_aman_sensor(self):
+        # < ~27 dtk: lompatan 65 -> 200 C mustahil secara fisik -> SENSOR ERROR (kode 2)
+        s = np.full(250, 65.0); s[150:] = 200.0                   # 20 dtk bacaan salah
         pid, log = self.jalankan_pid(s)
-        self.assertFalse(pid.on)
-        self.assertEqual(pid.alasan_mati, "sensor")                # bukan "suhu": sensor tidak dipercaya
+        self.assertTrue(pid.on)                                    # rev 27: PID tidak pernah mati otomatis
+        self.assertEqual((pid.safe, pid.out), (2, 0.0))            # TAHAN AMAN karena SENSOR, katup TUTUP
         self.assertLess(max(r[1] for r in log if not np.isnan(r[1]) and r[0] < 165), 66.0)
+        # > ~27 dtk: angka 200 secara fisik mungkin -> diterima -> suhu >= 180 (kode 3), tetap ON & TUTUP
+        s = np.full(400, 65.0); s[150:] = 200.0
+        pid, _ = self.jalankan_pid(s)
+        self.assertTrue(pid.on)
+        self.assertEqual((pid.safe, pid.out), (3, 0.0))
 
     def test_acuan_tidak_hilang_200_baru_diterima_setelah_27_detik(self):
         s = np.full(400, 65.0); s[150:] = 200.0
