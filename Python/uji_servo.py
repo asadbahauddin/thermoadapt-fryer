@@ -103,30 +103,31 @@ class UjiStatis(unittest.TestCase):
 
 
 class UjiPerintah(unittest.TestCase):
-    def test_bug_lama_minus1_di_0_sekarang_jalan(self):
+    def test_minus1_minimum_rev31(self):
         s = Servo()
-        s.cmd("svad,-1")
-        self.assertEqual(s.target, -1)
+        s.cmd("svad,-1"); self.assertEqual(s.target, -1)
         self.assertAlmostEqual(s.us(s.target), 488.89, places=2)
-        s.cmd("sva,-5"); self.assertEqual(s.target, -5)
-        s.cmd("svk,-2"); self.assertEqual(s.target, -2)
-
-    def test_batas_pulsa(self):
+        s.cmd("svad,-1"); self.assertEqual(s.target, -1)          # tidak bisa di bawah -1
+        self.assertIn("Sudut harus -1..180", s.pesan[-1])
+        s.cmd("sva,-5"); self.assertEqual(s.target, -1)
+        s.cmd("svk,-2"); self.assertEqual(s.target, -1)
+    def test_batas_atas(self):
         s = Servo()
-        for _ in range(30):
-            s.cmd("svad,-1")
-        self.assertEqual(s.target, -18)                  # 300 us
-        self.assertTrue(any("Ditolak: pulsa" in p for p in s.pesan))
-        s.cmd("svk,-31"); self.assertIn("Sudut harus -30..180", s.pesan[-1])
-
-    def test_simpan_tutup_negatif_dan_pid_ikut(self):
+        s.cmd("svk,181"); self.assertIn("Sudut harus -1..180", s.pesan[-1])
+        s.cmd("svk,180"); self.assertEqual(s.target, 180)
+    def test_simpan_tutup_minus1_dan_pid_ikut(self):
         s = Servo()
-        s.cmd("svk,-3"); s.cmd("svset,c")
-        self.assertEqual(s.cd, -3)                       # dulu (int)(x+0.5) -> -2
-        s.cmd("sv,0"); self.assertEqual(s.target, -3)   # TUTUP / PID 0% = -3
+        s.cmd("svk,-1"); s.cmd("svset,c")
+        self.assertEqual(s.cd, -1)
+        s.cmd("sv,0"); self.assertEqual(s.target, -1)             # TUTUP / PID 0% = -1
         s.cmd("sv,100"); self.assertEqual(s.target, 55)
-        s.set_angle(-10); self.assertEqual(s.target, -3)  # PID/step test tidak bisa lewat TUTUP
+        s.set_angle(-10); self.assertEqual(s.target, -1)          # PID/step test tidak bisa lewat TUTUP
 
+    def test_tutup_tersimpan_minus3_jadi_default_minus1(self):
+        self.assertEqual(CAL_MIN, -1)
+        ok = lambda c, o: c >= CAL_MIN and o <= 180 and o - c >= SPAN_MIN      # servoAnglesOk
+        self.assertFalse(ok(-3, 55))                               # flash lama -3 -> tidak lolos
+        self.assertEqual(int(re.search(r"#define DEFAULT_SERVO_CLOSED_DEG\s+(-?\d+)", SRC).group(1)), -1)
     def test_ditolak_saat_pid_atau_step_test(self):
         s = Servo(); s.pid_on = True
         s.cmd("svad,-1"); self.assertEqual(s.target, 0); self.assertEqual(s.pesan[-1], "PID aktif")

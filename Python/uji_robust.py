@@ -47,6 +47,15 @@ class UjiStatis(unittest.TestCase):
         ui = re.search(r"void uiTask\(void\*\) \{(.*?)\n\}", KODE, re.S).group(1)
         self.assertIn("vTaskDelay(pdMS_TO_TICKS(10))", ui)
 
+    def test_lcd_mati_hanya_max31855_di_spi(self):           # rev 31
+        self.assertRegex(SRC, r"#define LCD_ENABLE\s+0")
+        blok = re.search(r"#else\s*\n\s*if \(!sensorReady\) \{(.*?sensorReady = true;)", SRC, re.S).group(1)
+        self.assertIn("digitalWrite(TFT_CS, HIGH)", blok)
+        self.assertIn("digitalWrite(TOUCH_CS, HIGH)", blok)
+        self.assertIn("thermocouple.begin()", blok)
+        for terlarang in ("tft.", "PIN_TFT_RST", "uiStatic"):
+            self.assertNotIn(terlarang, blok)
+
     def test_reset_manual_hanya_pasang_flag(self):
         # perintah dari loop() (core 1) tidak boleh menyentuh SPI; hanya flag untuk uiTask
         blok = re.search(r'strcmp\(cmd, "lcdr"\) == 0\) \{(.*?)\n  \}', KODE, re.S).group(1)

@@ -1,8 +1,14 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 30)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 31)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 31 (dari rev 30):
+ *   - LCD DIMATIKAN (LCD_ENABLE 0): tidak diinisialisasi/digambar; bus SPI hanya untuk MAX31855.
+ *     CS LCD (4) & CS touch (16) ditahan HIGH; GPIO15 (RESET LCD) tidak dikendalikan.
+ *     Tombol "Reset LCD" membalas "LCD dimatikan". LCD_ENABLE 1 = perilaku rev 30.
+ *   - Sudut servo paling minimum -1 derajat (manual, kalibrasi, TUTUP). TUTUP tersimpan -3 -> -1.
  *
  * REV 30 (dari rev 29): PENGAMAN 180 C DINONAKTIFKAN (keputusan pengguna, ada E-stop fisik)
  *   - PID_CUTOFF_ENABLE 0: tidak ada batas suhu otomatis di PID (kode tetap ada; ganti ke 1 untuk
@@ -219,9 +225,12 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 30"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 31"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
+#define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
+                                  //   CS LCD (TFT_CS) & CS touch (TOUCH_CS) ditahan HIGH. GPIO15 (RESET LCD)
+                                  //   sengaja TIDAK dikendalikan (bila RESET disolder ke 3V3, LOW = hubung singkat).
 #define LCD_REINIT_MS   0UL       // rev 23: reset LCD otomatis MATI (rev 22 tiap 30 dtk terasa kurang stabil);
                                   // reset manual lewat tombol "Reset LCD" di web. >0 = reset otomatis tiap N ms
 #define WDT_TIMEOUT_S   10        // loop() atau uiTask macet > 10 dtk -> ESP restart
@@ -315,12 +324,15 @@ IPAddress AP_MASK(255, 255, 255, 0);
 #define SERVO_US_ABS_MAX        3000
 #define DEFAULT_SERVO_US_MIN    500      // us untuk 0 derajat   (BELUM terverifikasi)
 #define DEFAULT_SERVO_US_MAX    2500     // us untuk 180 derajat (BELUM terverifikasi)
-#define DEFAULT_SERVO_CLOSED_DEG -3      // rev 21: TUTUP hasil kalibrasi di alat = -3 derajat
+#define DEFAULT_SERVO_CLOSED_DEG -1      // rev 31: TUTUP = -1 derajat (sudut minimum untuk uji berikut).
+                                         // rev 21 sempat -3 (servo mentok, api sangat kecil)
                                          // (servo mentok; api sangat kecil yang tidak menaikkan suhu)
 #define DEFAULT_SERVO_OPEN_DEG   55      // sudut katup BUKA  (hasil kalibrasi: membuka di 55 derajat)
 #define SERVO_SLEW_DEG_S        0.0f     // 0 = tanpa batas laju (melompat ke target)
 #define SERVO_MIN_SPAN_DEG      5        // rev 18: BUKA - TUTUP minimal (derajat)
-#define SERVO_CAL_MIN_DEG       -30      // rev 19: kalibrasi boleh di bawah 0 derajat (sudut negatif =
+#define SERVO_CAL_MIN_DEG       -1       // rev 31: SUDUT PALING MINIMUM -1 (manual, kalibrasi, TUTUP).
+                                         // TUTUP tersimpan < -1 (mis. -3) gagal servoAnglesOk -> default -1.
+                                         // rev 19: kalibrasi boleh di bawah 0 derajat (sudut negatif =
                                          // pulsa < pulsa 0 derajat, mis. -1 = 500 - 11 = ~489 us).
                                          // Batas sebenarnya: pulsa >= SERVO_US_ABS_MIN (~ -18 derajat default)
 
@@ -568,12 +580,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div style="margin-top:8px">Sudut: <input id="sva_in" type="text" inputmode="text" placeholder="derajat"
         onkeydown="if(event.key==='Enter')svAngle()"> &deg; <button onclick="svAngle()">Gerak</button>
       &nbsp; <button onclick="send('svad,-1')">-1&deg;</button><button onclick="send('svad,1')">+1&deg;</button></div>
-    <small>Manual (kotak sudut, -1/+1): bebas -30..180&deg; (dibatasi pulsa servo 300-3000 &micro;s).
+    <small>Manual (kotak sudut, -1/+1): -1..180&deg; (-1&deg; = sudut paling minimum).
     PID &amp; step test dikunci antara TUTUP (<span class="lcd">0</span>&deg;) dan BUKA (<span class="lod">55</span>&deg;).</small>
 
     <div style="margin-top:12px;border-top:1px solid #333;padding-top:8px;text-align:left">
       <b>Kalibrasi katup</b> (PID harus OFF, step test tidak berjalan)<br>
-      Sudut uji: <input id="svk_in" type="text" inputmode="text" placeholder="-30..180"
+      Sudut uji: <input id="svk_in" type="text" inputmode="text" placeholder="-1..180"
         onkeydown="if(event.key==='Enter')svCalGo(0)"> &deg;
       <button onclick="svCalGo(0)">Gerak</button>
       <button onclick="svCalGo(-1)">-1&deg;</button><button onclick="svCalGo(1)">+1&deg;</button><br>
@@ -584,8 +596,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       180&deg; = <input id="sumax" type="text" inputmode="numeric"> &micro;s
       <button onclick="svCalPulse()">Simpan pulsa</button><br>
       <small>Cara: gerakkan per 1&deg; ke arah menutup sampai api sekecil mungkin, lalu "Simpan sbg TUTUP".
-      Bila di 0&deg; masih besar, lanjut ke -1&deg;, -2&deg;, ... (sudut negatif = pulsa di bawah pulsa 0&deg;; batas
-      sekitar -18&deg; dgn pulsa default). Berhenti di sudut terakhir yang servonya masih DIAM; bila berdengung/menekan
+      Sudut paling minimum -1&deg;. Berhenti di sudut terakhir yang servonya masih DIAM; bila berdengung/menekan
       stopper, naikkan 1&deg;. Api kecil di TUTUP harus tidak mampu menaikkan suhu (uji: minyak panas, TUTUP
       10 menit, suhu turun/diam). <b>PERINGATAN:</b> servo BUKAN pemutus gas; bila api di TUTUP sampai padam,
       gas keluar TANPA api saat katup membuka lagi. Harus ada orang di dekat mesin.</small>
@@ -658,7 +669,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
   <small id="info"></small><br>
   <small id="diag"></small><br>
-  <button onclick="send('lcdr')">Reset LCD</button>
+  <button onclick="send('lcdr')">Reset LCD</button> <small>(LCD saat ini dimatikan di firmware)</small>
   <small>Pin RESET LCD + inisialisasi ulang + gambar ulang (~0,5 dtk). Pakai bila layar putih/membeku.</small>
 
 <script>
@@ -688,7 +699,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   function svCalGo(step){
     const now = Math.round(num('svk_in'));                 // dasar = isi kotak (langsung terbarui tiap klik)
     let d = step === 0 ? now : (isFinite(now) ? now : svSg) + step;
-    if (!isFinite(d) || d < -30 || d > 180) { $('log').textContent = 'Sudut uji harus -30..180'; return; }
+    if (!isFinite(d) || d < -1 || d > 180) { $('log').textContent = 'Sudut uji harus -1..180'; return; }
     $('svk_in').value = d; clean(['svk_in']);
     send('svk,' + d);
   }
@@ -1520,6 +1531,9 @@ void handleCommand(const char* cmd) {
   // ---- rev 23: "lcdr" reset LCD manual. Hanya memasang flag; reset dikerjakan uiTask (core 0)
   // karena hanya task itu yang memakai bus SPI LCD/MAX31855 (tidak ada akses SPI dari 2 core).
   if (strcmp(cmd, "lcdr") == 0) {
+#if !LCD_ENABLE
+    sendMsg("LCD dimatikan di firmware (LCD_ENABLE 0)"); return;
+#endif
     gLcdResetReq = true;
     sendMsg("Reset LCD diminta");
     return;
@@ -1986,7 +2000,18 @@ void uiTask(void*) {
   bool first = true;
   for (;;) {
     uint32_t now = millis();
+#if LCD_ENABLE
     lcdService(now);                                         // reset/init LCD bertahap
+#else
+    if (!sensorReady) {                                      // rev 31: tanpa LCD, hanya MAX31855 di SPI
+      pinMode(TFT_CS, OUTPUT);   digitalWrite(TFT_CS, HIGH);     // LCD tidak dipilih
+#ifdef TOUCH_CS
+      pinMode(TOUCH_CS, OUTPUT); digitalWrite(TOUCH_CS, HIGH);   // chip touch tidak memakai MISO
+#endif
+      if (!thermocouple.begin()) Serial.println(F("MAX31855 begin() GAGAL: cek wiring CS5, SO19, SCK18, VCC 3V3"));
+      sensorReady = true;
+    }
+#endif
     if (sensorReady && (first || now - lastTemp >= SENSOR_SAMPLE_MS)) {
       first = false; lastTemp = now;
       gRaw = maxReadRaw();
