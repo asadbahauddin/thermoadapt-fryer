@@ -3,7 +3,8 @@
 Firmware mengirim 3 jenis pesan JSON:
   temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms, st, te (rev 14), tr, held, ec (rev 15),
                 pe, pu, se (rev 16: PID aktif, keluaran %, setpoint efektif),
-                kpe, kie, kde (rev 17: gain yang SEDANG dipakai, adaptif), ph (rev 24: tahan overshoot)
+                kpe, kie, kde (rev 17: gain yang SEDANG dipakai, adaptif), ph (rev 24: tahan overshoot),
+                uj, us, uf (rev 33: tahap Uji Sistem, detik tahap/sisa timer, timer goreng)
                 t = suhu tersaring (rev 21: median-5 -> moving avg-5 -> EMA, + hold), tr = mentah
   st   (4 Hz) : ls[4], raw[4], vr[4], il[4], pn[4], bn, dx, xp, xm, en, sx, ax,
                 sa, sg, sr, sl, um, ux, cd, od, tc, dcc, dct, dcm, dcv, sp,
@@ -29,6 +30,9 @@ KOLOM = (
      "err_fault_tc", "err_frame_rusak", "err_baca_beda", "err_cj", "err_lompatan", "suhu_chip_c",
      # rev 14: status step test di firmware (0 siap, 1 berjalan, 2 selesai, 3 berhenti) + detik berjalan
      "step_test_status", "step_test_elapsed_s",
+     # rev 33: Uji Sistem (tahap 0 siap, 1 Z naik, 2 X awal, 3 tunggu suhu, 4 Z turun, 5 goreng,
+     # 6 Z naik, 7 X akhir, 8 selesai, 9 batal); detik = lama tahap (tahap 5: SISA timer)
+     "uji_tahap", "uji_detik", "uji_timer_s",
      "setpoint_c", "error_c",
      # PID (rev 16): kosong bila firmware lama
      # kp/ki/kd = gain yang SEDANG dipakai (berubah tiap sampel saat adaptif); kp0.. = gain dasar
@@ -158,6 +162,9 @@ class Penggabung:
         r["sensor_error_total"] = _bulat(m.get("ec"))
         r["step_test_status"] = _bulat(m.get("st"))
         r["step_test_elapsed_s"] = _bulat(m.get("te"))
+        r["uji_tahap"] = _bulat(m.get("uj"))              # rev 33: kosong bila firmware lama
+        r["uji_detik"] = _bulat(m.get("us"))
+        r["uji_timer_s"] = _bulat(m.get("uf"))
         r["pid_aktif"] = _bulat(m.get("pe"))
         r["pid_output_pct"] = _angka(m.get("pu"))
         r["pid_tahan"] = _bulat(m.get("ph"))              # 1 = overshoot, katup ditahan TUTUP

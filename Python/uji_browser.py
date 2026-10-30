@@ -37,7 +37,7 @@ ST = {"type":"st","ls":[0,0,0,0],"raw":[1,1,1,1],"vr":[1,1,1,1],"il":[1,1,1,1],"
 def temp(seq):
     return {"type":"temp","t":150.25,"ok":True,"raw":"09640000","d":"frame valid","up":seq,"sp":160.0,
             "seq":seq,"ms":seq*1000,"st":0,"te":0,"tr":150.3,"held":0,"ec":0,"pe":0,"pu":0.0,"se":None,
-            "kpe":1.46,"kie":0.0054,"kde":0.0,"ph":0}
+            "kpe":1.46,"kie":0.0054,"kde":0.0,"ph":0,"uj":5,"us":87,"uf":120}
 
 def frame(t):
     d = t.encode(); n = len(d)

@@ -1,8 +1,15 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 32)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 33)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 33 (dari rev 32): UJI SISTEM / UJI KEMATANGAN OTOMATIS (perintah "uj,<detik>")
+ *   - Z naik ke Z Atas -> X ke X Awal -> suhu di SP-3..SP+7 selama 10 dtk -> Z turun 50% sampai
+ *     Z Bawah -> timer goreng (default 120 dtk, 5-1800 dari web) -> Z naik 55% sampai Z Atas ->
+ *     X ke X Akhir (tetap di sana). Gerak uji tanpa batas waktu (limit switch yang menghentikan).
+ *   - PID dinyalakan otomatis & tetap ON. STOP membatalkan uji. Gerak manual ditolak selama uji.
+ *   - JSON "temp": uj (tahap 0-9), us (detik; tahap 5 = sisa timer), uf (timer); dicatat logger.
  *
  * REV 32 (dari rev 31): PEMBACAAN MAX31855 DIPERKUAT (analisis bacaan 200 C)
  *   - Tiap sampel: frame dibaca 2x berturut-turut; berbeda = data rusak di SPI -> ditolak.
@@ -232,7 +239,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 32"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 33"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -638,6 +645,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="box">
+    <h2>Uji Sistem (Kematangan)</h2>
+    <div>Timer goreng: <input id="ujf" type="number" value="120" min="5" max="1800" step="5"> detik
+      <button onclick="ujStart()" style="font-size:1.1em">MULAI UJI</button>
+      <button class="stop" onclick="send('stop')" style="width:auto">STOP</button></div>
+    <div id="ujs" class="pos" style="margin:6px 0">Siap.</div>
+    <small>Urutan: Z naik ke Z Atas &rarr; X ke X Awal &rarr; tunggu suhu di setpoint -3..+7 &deg;C selama
+    10 dtk &rarr; Z TURUN 50% sampai Z Bawah &rarr; timer &rarr; Z NAIK 55% sampai Z Atas &rarr; X ke X Akhir
+    (berhenti di sana). PID dinyalakan otomatis dan tetap ON. Gerak tanpa batas waktu: berhenti oleh limit
+    switch, jadi pastikan keempat limit berfungsi. STOP membatalkan uji (PID ikut mati).</small>
+  </div>
+
+  <div class="box">
     <h2>Step Test (open-loop)</h2>
     <div>Bukaan: <input id="stang" type="number" value="30" min="1" max="55" step="1"> &deg; (maks <span class="lod">55</span>)
       &nbsp; Batas suhu: <input id="stmax" type="number" value="170" min="60" max="175"> &deg;C
@@ -747,6 +766,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     if (l.some(x => !isFinite(x))) { $('log').textContent = 'Lambda tidak valid'; return; }
     send('pidl,' + l[0].toFixed(4) + ',' + l[1].toFixed(5) + ',' + l[2].toFixed(3));
     clean(['plp','pli','pld']);
+  }
+  function ujStart(){
+    const f = parseInt($('ujf').value, 10);
+    if (!(f >= 5 && f <= 1800)) { $('log').textContent = 'Timer 5-1800 detik'; return; }
+    send('uj,' + f);
+  }
+  const UJ_TAHAP = {0:'Siap.', 1:'1/7 Z naik ke Z Atas', 2:'2/7 X ke X Awal', 3:'3/7 Menunggu suhu dekat setpoint',
+    4:'4/7 Z TURUN', 5:'5/7 MENGGORENG', 6:'6/7 Z NAIK', 7:'7/7 X ke X Akhir', 8:'SELESAI (X di X Akhir)', 9:'DIBATALKAN'};
+  function ujFeed(m){
+    let s = UJ_TAHAP[m.uj] || ('tahap ' + m.uj);
+    if (m.uj === 3) s += ' - di rentang ' + m.us + '/10 dtk';
+    else if (m.uj === 5) s += ' - sisa ' + Math.floor(m.us / 60) + ':' + String(m.us % 60).padStart(2, '0');
+    else if (m.uj >= 1 && m.uj <= 7) s += ' (' + m.us + ' dtk)';
+    $('ujs').textContent = s;
+    $('ujs').className = (m.uj === 9) ? 'pos err' : (m.uj === 8 ? 'pos ok' : 'pos');
   }
   function sendSp(){
     const v = parseFloat(String($('spin').value).replace(',', '.'));   // "160,5" juga diterima
@@ -940,6 +974,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
       if (data.length > MAXPTS) data.shift();
       if (typeof m.st === 'number') stepFeed(m);
+      if (typeof m.uj === 'number') ujFeed(m);
       if (typeof m.pe === 'number') {
         const TAHAN = {1:'overshoot', 2:'SENSOR ERROR', 3:'SUHU >= 180 C', 4:'DATA SUHU BERHENTI'};
         $('pids').textContent = m.pe ? (m.ph ? 'PID AKTIF - TAHAN AMAN (' + (TAHAN[m.ph] || m.ph) + ', katup TUTUP)' : 'PID AKTIF') : 'PID mati';
@@ -1103,6 +1138,8 @@ void buzzerUpdate() {
 float        dcCur    = 0;        // keluaran terhaluskan, persen dari batas (-100..100)
 volatile int dcTarget = 0;        // target persen (-100..100); positif = naik
 uint32_t     dcRunStart = 0;
+bool         dcLimitStop = false; // rev 33: true = gerak terakhir dihentikan limit (tahan pantulan kontak)
+bool         dcNoTimeout = false; // rev 33: true = gerak Uji Sistem (berhenti oleh limit, tanpa batas waktu)
 
 float dcCap() {                   // duty maksimum sebagai pecahan (RATED / SUPPLY, maks 1)
   float c = MOTOR_RATED_V / MOTOR_SUPPLY_V;
@@ -1155,6 +1192,8 @@ void dcSetTarget(int pct) {
   }
   dcTarget = pct;
   dcRunStart = millis();
+  dcNoTimeout = false;
+  dcLimitStop = false;
 }
 
 // dipanggil tiap loop; kerja tiap 10 ms
@@ -1166,9 +1205,9 @@ void dcUpdate() {
   last = now;
 
   if (dcTarget != 0 && limitBlocks('Z', dcTarget > 0 ? 1 : -1)) {
-    dcStop(); sendMsg("Limit Z kena: motor DC berhenti");
+    dcStop(); dcLimitStop = true; sendMsg("Limit Z kena: motor DC berhenti");
   }
-  if (dcTarget != 0 && (now - dcRunStart) > DC_MAX_RUN_MS) {
+  if (dcTarget != 0 && !dcNoTimeout && (now - dcRunStart) > DC_MAX_RUN_MS) {
     dcStop(); sendMsg("Batas waktu motor DC: berhenti"); buzzPlay(3);
   }
 
@@ -1528,15 +1567,125 @@ bool pidLambdaOk(float lp, float li, float ld) {
 }
 
 // ---------------- PENGAMAN STEPPER X (tiap loop) ----------------
+// ---------------- UJI SISTEM / UJI KEMATANGAN (rev 33) ----------------
+// Urutan: 1 Z naik ke Z Atas -> 2 X ke X Awal -> 3 tunggu suhu di SP-3..SP+7 selama 10 dtk
+// berturut-turut -> 4 Z turun (50%) sampai Z Bawah -> 5 goreng (timer, default 2 menit) ->
+// 6 Z naik (55%) sampai Z Atas -> 7 X ke X Akhir -> 8 SELESAI (X tetap di X Akhir).
+// Gerak Z/X TANPA batas waktu: berhenti oleh limit switch. Tombol STOP membatalkan (9).
+// PID dinyalakan otomatis saat mulai dan tetap ON setelah selesai.
+#define UJ_BAND_LO_C      3.0f      // batas bawah "dekat setpoint" = SP - 3
+#define UJ_BAND_HI_C      7.0f      // batas atas = SP + 7 (contoh SP 160 -> 157..167)
+#define UJ_STABLE_MS      10000UL   // lama suhu harus di dalam rentang (berturut-turut)
+#define UJ_PCT_DOWN       50        // kecepatan Z turun (persen)
+#define UJ_PCT_UP         55        // kecepatan Z naik (persen)
+#define UJ_FRY_DEFAULT_S  120       // timer goreng default (detik)
+#define UJ_FRY_MIN_S      5
+#define UJ_FRY_MAX_S      1800
+#define UJ_X_FAR          1000000000L   // "jauh sekali": X berhenti oleh limit
+volatile uint8_t ujState = 0;       // 0 siap, 1..7 berjalan, 8 selesai, 9 dibatalkan
+uint32_t ujFryMs = UJ_FRY_DEFAULT_S * 1000UL;
+uint32_t ujT0 = 0;                  // awal tahap sekarang
+uint32_t ujInBandMs = 0;            // awal suhu masuk rentang (0 = di luar)
+bool     xLimitStop = false;        // gerak X terakhir dihentikan limit (tahan pantulan kontak)
+
+bool ujRunning() { return ujState >= 1 && ujState <= 7; }
+
+// detik untuk web/logger: tahap 3 = lama suhu di rentang, tahap 5 = SISA timer, lainnya = lama tahap
+long ujSecs() {
+  uint32_t now = millis();
+  if (ujState == 3) return ujInBandMs ? (long)((now - ujInBandMs) / 1000UL) : 0;
+  if (ujState == 5) { uint32_t el = now - ujT0; return el >= ujFryMs ? 0 : (long)((ujFryMs - el + 999UL) / 1000UL); }
+  if (ujRunning()) return (long)((now - ujT0) / 1000UL);
+  return 0;
+}
+
+void ujEnd(uint8_t st, const char* why) {
+  dcStop(); hardStop(stepX);
+  ujState = st;
+  sendMsg(why);
+  buzzPlay(st == 8 ? 2 : 3);
+}
+
+void ujMoveX(int dir) {             // dir +1 = ke X Akhir, -1 = ke X Awal
+  if (!driversEnabled) setDrivers(true);
+  long s = X_PLUS_TOWARD_AKHIR ? UJ_X_FAR : -UJ_X_FAR;
+  xLimitStop = false;
+  stepX.move(dir > 0 ? s : -s);
+}
+
+void ujMoveZ(int pct) { dcSetTarget(pct); dcNoTimeout = true; }
+
+void ujEnter(uint8_t st) {
+  ujState = st; ujT0 = millis();
+  switch (st) {
+    case 1: if (!lsHit(LS_ZATAS)) { ujMoveZ(UJ_PCT_UP); sendMsg("Uji: Z naik ke Z Atas"); } break;
+    case 2: if (!lsHit(LS_XAWAL)) { ujMoveX(-1); sendMsg("Uji: X ke X Awal"); } break;
+    case 3: ujInBandMs = 0; sendMsg("Uji: menunggu suhu dekat setpoint (10 dtk)"); break;
+    case 4: ujMoveZ(-UJ_PCT_DOWN); sendMsg("Uji: Z TURUN"); break;
+    case 5: buzzPlay(1); sendMsg("Uji: Z Bawah kena - TIMER GORENG mulai"); break;
+    case 6: buzzPlay(1); ujMoveZ(UJ_PCT_UP); sendMsg("Uji: timer habis - Z NAIK"); break;
+    case 7: ujMoveX(1); sendMsg("Uji: X ke X Akhir"); break;
+  }
+}
+
+void ujStart(int fryS) {
+  if (ujRunning()) { sendMsg("Uji sistem sudah berjalan"); return; }
+  if (BENCH_MODE) { sendMsg("Uji ditolak: BENCH_MODE aktif (limit tidak mengamankan)"); return; }
+  if (fryS < UJ_FRY_MIN_S || fryS > UJ_FRY_MAX_S) { sendMsg("Uji ditolak: timer 5-1800 detik"); return; }
+  if (stState == 1) { sendMsg("Uji ditolak: step test sedang berjalan"); return; }
+  if (lsHit(LS_ZATAS) && lsHit(LS_ZBAWAH)) { sendMsg("Uji ditolak: Z Atas & Z Bawah kena bersamaan (cek kabel)"); return; }
+  if (lsHit(LS_XAWAL) && lsHit(LS_XAKHIR)) { sendMsg("Uji ditolak: X Awal & X Akhir kena bersamaan (cek kabel)"); return; }
+  ujFryMs = (uint32_t)fryS * 1000UL;
+  if (!pidOn) pidEnable();
+  sendMsg("Uji sistem MULAI");
+  ujEnter(1);
+}
+
+void ujUpdate() {
+  if (!ujRunning()) return;
+  uint32_t now = millis();
+  switch (ujState) {
+    case 1: case 6:                                    // Z naik sampai Z Atas
+      if (lsHit(LS_ZATAS) || dcLimitStop) { dcStop(); ujEnter(ujState == 1 ? 2 : 7); }
+      else if (dcTarget <= 0) ujEnd(9, "Uji DIBATALKAN: gerak Z naik terhenti");
+      break;
+    case 4:                                            // Z turun sampai Z Bawah
+      if (lsHit(LS_ZBAWAH) || dcLimitStop) { dcStop(); ujEnter(5); }
+      else if (dcTarget >= 0) ujEnd(9, "Uji DIBATALKAN: gerak Z turun terhenti");
+      break;
+    case 2: case 7: {                                  // X sampai limit
+      int li = (ujState == 2) ? LS_XAWAL : LS_XAKHIR;
+      if (lsHit(li) || xLimitStop) { hardStop(stepX); if (ujState == 2) ujEnter(3); else ujEnd(8, "Uji sistem SELESAI (X di X Akhir)"); }
+      else if (stepX.distanceToGo() == 0) ujEnd(9, "Uji DIBATALKAN: gerak X terhenti");
+      break; }
+    case 3: {                                          // tunggu suhu dekat setpoint
+      float t = gTemp, sp = gSetpoint;
+      bool in = !isnan(t) && t >= sp - UJ_BAND_LO_C && t <= sp + UJ_BAND_HI_C;
+      if (!in) ujInBandMs = 0;
+      else if (!ujInBandMs) ujInBandMs = now ? now : 1;
+      else if (now - ujInBandMs >= UJ_STABLE_MS) ujEnter(4);
+      break; }
+    case 5:
+      if (now - ujT0 >= ujFryMs) ujEnter(6);
+      break;
+  }
+}
+
 void enforceSafety() {
   long dx = stepX.distanceToGo();
-  if (dx != 0 && limitBlocks('X', dx > 0 ? 1 : -1)) { hardStop(stepX); sendMsg("Limit X kena: gerak dihentikan"); }
+  if (dx != 0 && limitBlocks('X', dx > 0 ? 1 : -1)) { hardStop(stepX); xLimitStop = true; sendMsg("Limit X kena: gerak dihentikan"); }
 }
 
 // ---------------- PERINTAH DARI WEB ----------------
 void handleCommand(const char* cmd) {
   char ax; long steps; int v, a, b;
 
+  // ---- rev 33: Uji Sistem "uj,<detik goreng>". Selama uji, gerak manual Z/X ditolak.
+  if (sscanf(cmd, "uj,%d", &v) == 1) { ujStart(v); return; }
+  if (ujRunning() && (strncmp(cmd, "jog,", 4) == 0 || strncmp(cmd, "dcz,", 4) == 0 || strncmp(cmd, "en,", 3) == 0
+                      || strncmp(cmd, "stt,", 4) == 0 || strncmp(cmd, "dir,", 4) == 0)) {
+    sendMsg("Uji sistem berjalan: gerak manual ditolak (STOP untuk batal)"); return;
+  }
   if (sscanf(cmd, "jog,%c,%ld", &ax, &steps) == 2) {
     if (ax == 'Z') { sendMsg("Z = motor DC: pakai kotak Motor DC Z"); return; }
     if (ax != 'X') { sendMsg("Axis tidak dikenal"); return; }
@@ -1559,6 +1708,7 @@ void handleCommand(const char* cmd) {
   }
   if (strcmp(cmd, "stop") == 0) {
     hardStop(stepX); dcStop();
+    if (ujRunning()) ujEnd(9, "Uji sistem DIBATALKAN (STOP)");
     bool hadPid = pidOn;
     if (hadPid) pidDisable("PID MATI (STOP): katup ke TUTUP");
     if (stState == 1) { stepTestEnd(3, "Step test DIBATALKAN (STOP)"); return; }
@@ -1750,12 +1900,13 @@ void broadcastTemp() {
   bool pe = pidOn;
   char ses[16];
   if (pe) snprintf(ses, sizeof(ses), "%.2f", pidSpEff); else strcpy(ses, "null");
-  char b[560];
+  char b[600];
+  // rev 33: uj = tahap Uji Sistem, us = detik tahap (tahap 5 = SISA timer), uf = timer goreng (dtk)
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0);
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0);
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d,\"uj\":%d,\"us\":%ld,\"uf\":%lu}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0, (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL));
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d,\"uj\":%d,\"us\":%ld,\"uf\":%lu}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0, (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL));
   ws.broadcastTXT(b);
 }
 
@@ -2217,6 +2368,7 @@ void loop() {
   enforceSafety();
   stepX.run();
   stepTestUpdate();
+  ujUpdate();                       // rev 33: Uji Sistem (sebelum dcUpdate: limit dicek di sini dulu)
   servoUpdate();
   dcUpdate();
   buzzerUpdate();
