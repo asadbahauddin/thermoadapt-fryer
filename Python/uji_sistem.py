@@ -1,7 +1,7 @@
 """Uji fitur Uji Sistem (rev 33) TANPA hardware:  python uji_sistem.py
 
-1. Cek statis dep_frayer.ino: konstanta sesuai permintaan (rentang SP-3..SP+7, 30 dtk, turun 50%,
-   naik 55%, timer default 120 dtk), urutan tahap, STOP membatalkan, gerak manual ditolak, gerak uji
+1. Cek statis dep_frayer.ino: konstanta sesuai permintaan (rentang SP+-3, 30 dtk, turun 50%,
+   naik 60%, timer default 120 dtk), urutan tahap, STOP membatalkan, gerak manual ditolak, gerak uji
    tanpa batas waktu, jumlah format snprintf JSON "temp" = jumlah argumen.
 2. Simulasi garis waktu (porting ujUpdate + model mekanik Z/X + limit switch), langkah 10 ms.
 3. Parser logger membaca kolom uji_tahap / uji_detik / uji_timer_s.
@@ -34,10 +34,10 @@ def blok(sig):
 class UjiStatis(unittest.TestCase):
     def test_konstanta_permintaan(self):
         self.assertEqual(d("UJ_BAND_LO_C"), 3.0)
-        self.assertEqual(d("UJ_BAND_HI_C"), 7.0)
+        self.assertEqual(d("UJ_BAND_HI_C"), 3.0)
         self.assertEqual(d("UJ_STABLE_MS"), 30000)
         self.assertEqual(d("UJ_PCT_DOWN"), 50)
-        self.assertEqual(d("UJ_PCT_UP"), 55)
+        self.assertEqual(d("UJ_PCT_UP"), 60)
         self.assertEqual(d("UJ_FRY_DEFAULT_S"), 120)
 
     def test_stop_membatalkan_uji(self):
@@ -116,7 +116,7 @@ class SimUji:
         self.state, self.t0 = st, self.now
         self.log.append((self.now, st))
         if st == 1 and not self.lsHit(0):
-            self.dcSetTarget(55)
+            self.dcSetTarget(d("UJ_PCT_UP"))
         elif st == 2 and not self.lsHit(2):
             self.moveX(-1)
         elif st == 3:
@@ -124,7 +124,7 @@ class SimUji:
         elif st == 4:
             self.dcSetTarget(-50)
         elif st == 6:
-            self.dcSetTarget(55)
+            self.dcSetTarget(d("UJ_PCT_UP"))
         elif st == 7:
             self.moveX(1)
 
@@ -165,7 +165,7 @@ class SimUji:
                 self.end(9)
         elif st == 3:
             t = self.f.temps(now / 1000.0)
-            inn = t is not None and self.sp - 3 <= t <= self.sp + 7
+            inn = t is not None and self.sp - d("UJ_BAND_LO_C") <= t <= self.sp + d("UJ_BAND_HI_C")
             if not inn:
                 self.inband = 0
             elif not self.inband:
@@ -219,23 +219,28 @@ class UjiGarisWaktu(unittest.TestCase):
         self.assertLessEqual(sim.log[2][0], 20)           # tanpa gerak: langsung tahap 3
 
     def test_tunggu_10_detik_berturut_turut(self):
-        # suhu: 150 (di luar) s/d 20 dtk, keluar sebentar di 25 dtk, lalu 158-166 berulang
+        # suhu: 150 (di luar) s/d 20 dtk, keluar sebentar di 25 dtk, lalu 157.5-162.5 berulang
         def temps(t):
             if t < 20 or 25 <= t < 26:
                 return 150.0
-            return 162.0 + 4.0 * ((int(t) % 2) * 2 - 1)
+            return 160.0 + 2.5 * ((int(t) % 2) * 2 - 1)   # 157.5 / 162.5 bergantian (di rentang +-3)
         sim = SimUji(Fryer(z=100, x=0, temps=temps))
         sim.run(60_000)
         t4 = dict((s, ms) for ms, s in sim.log)[4]
         self.assertEqual(t4, 56_000)                          # 26 dtk + 30 dtk berturut-turut
 
+    def test_osilasi_keluar_rentang_tidak_turun(self):           # rev 36: 157..167 bolak-balik = belum stabil
+        temps = lambda t: 162.0 + 5.0 * (((int(t) // 5) % 2) * 2 - 1)          # 157 / 167 tiap 5 dtk
+        sim = SimUji(Fryer(z=100, x=0, temps=temps))
+        self.assertNotIn(4, sim.run(120_000))
+
     def test_suhu_di_luar_rentang_tidak_turun(self):
-        for suhu in (156.9, 167.1, None):
+        for suhu in (156.9, 163.1, None):
             sim = SimUji(Fryer(z=100, x=0, temps=lambda t, s=suhu: s))
             self.assertNotIn(4, sim.run(60_000), suhu)
 
     def test_batas_rentang_inklusif(self):
-        for suhu in (157.0, 167.0):
+        for suhu in (157.0, 163.0):
             sim = SimUji(Fryer(z=100, x=0, temps=lambda t, s=suhu: s))
             self.assertIn(4, sim.run(60_000), suhu)
 

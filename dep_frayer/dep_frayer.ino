@@ -1,8 +1,11 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 35)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 36)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 36 (dari rev 35): Uji Sistem - Z naik 60% (55% kurang kuat), rentang stabil SP +-3 C
+ *   (dulu SP-3..SP+7); tetap harus 30 dtk berturut-turut di rentang sebelum keranjang turun.
  *
  * REV 35 (dari rev 34): Uji Sistem - suhu dianggap stabil setelah 30 dtk (dulu 10 dtk)
  *   berturut-turut di SP-3..SP+7 sebelum keranjang diturunkan.
@@ -248,7 +251,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 35"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 36"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -665,8 +668,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <button onclick="ujStart()" style="font-size:1.1em">MULAI UJI</button>
       <button class="stop" onclick="send('stop')" style="width:auto">STOP</button></div>
     <div id="ujs" class="pos" style="margin:6px 0">Siap.</div>
-    <small>Urutan: Z naik ke Z Atas &rarr; X ke X Awal &rarr; tunggu suhu di setpoint -3..+7 &deg;C selama
-    30 dtk &rarr; Z TURUN 50% sampai Z Bawah &rarr; timer &rarr; Z NAIK 55% sampai Z Atas &rarr; X ke X Akhir
+    <small>Urutan: Z naik ke Z Atas &rarr; X ke X Awal &rarr; tunggu suhu di setpoint &plusmn;3 &deg;C selama
+    30 dtk &rarr; Z TURUN 50% sampai Z Bawah &rarr; timer &rarr; Z NAIK 60% sampai Z Atas &rarr; X ke X Akhir
     (berhenti di sana). PID dinyalakan otomatis dan tetap ON. Gerak tanpa batas waktu: berhenti oleh limit
     switch, jadi pastikan keempat limit berfungsi. STOP membatalkan uji (PID ikut mati).</small>
   </div>
@@ -1601,16 +1604,16 @@ bool pidLambdaOk(float lp, float li, float ld) {
 
 // ---------------- PENGAMAN STEPPER X (tiap loop) ----------------
 // ---------------- UJI SISTEM / UJI KEMATANGAN (rev 33) ----------------
-// Urutan: 1 Z naik ke Z Atas -> 2 X ke X Awal -> 3 tunggu suhu di SP-3..SP+7 selama 30 dtk
+// Urutan: 1 Z naik ke Z Atas -> 2 X ke X Awal -> 3 tunggu suhu di SP-3..SP+3 selama 30 dtk
 // berturut-turut -> 4 Z turun (50%) sampai Z Bawah -> 5 goreng (timer, default 2 menit) ->
-// 6 Z naik (55%) sampai Z Atas -> 7 X ke X Akhir -> 8 SELESAI (X tetap di X Akhir).
+// 6 Z naik (60%) sampai Z Atas -> 7 X ke X Akhir -> 8 SELESAI (X tetap di X Akhir).
 // Gerak Z/X TANPA batas waktu: berhenti oleh limit switch. Tombol STOP membatalkan (9).
 // PID dinyalakan otomatis saat mulai dan tetap ON setelah selesai.
 #define UJ_BAND_LO_C      3.0f      // batas bawah "dekat setpoint" = SP - 3
-#define UJ_BAND_HI_C      7.0f      // batas atas = SP + 7 (contoh SP 160 -> 157..167)
+#define UJ_BAND_HI_C      3.0f      // batas atas = SP + 3 (contoh SP 160 -> 157..163); rev 36: dulu +7
 #define UJ_STABLE_MS      30000UL   // lama suhu harus di dalam rentang (berturut-turut); rev 35: 10 -> 30 dtk
 #define UJ_PCT_DOWN       50        // kecepatan Z turun (persen)
-#define UJ_PCT_UP         55        // kecepatan Z naik (persen)
+#define UJ_PCT_UP         60        // kecepatan Z naik (persen); rev 36: dulu 55 (kurang kuat)
 #define UJ_FRY_DEFAULT_S  120       // timer goreng default (detik)
 #define UJ_FRY_MIN_S      5
 #define UJ_FRY_MAX_S      1800
