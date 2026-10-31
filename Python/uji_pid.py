@@ -115,7 +115,7 @@ class Pid:
         elif self.hold and t <= setpoint + HOLD - HYST:
             self.hold = False
         if self.hold:
-            self.I = self.out = 0.0
+            self.out = 0.0                               # rev 37: integral DIBEKUKAN (tidak dinolkan)
             self.ff_cancel()
             self.prev_t, self.df = t, 0.0
             self.gains(self.sp_eff - t, 0.0)
@@ -235,7 +235,8 @@ class UjiPid(unittest.TestCase):
         p = Pid(); p.enable(100, 0, False, 150, 30.0)
         p.update(161.0, 1000, False, 150, 1000, 1000)          # >= sp + 10
         self.assertTrue(p.on); self.assertTrue(p.hold)
-        self.assertEqual((p.out, p.I), (0.0, 0.0))             # katup TUTUP, integral nol
+        self.assertEqual(p.out, 0.0)                            # katup TUTUP
+        self.assertEqual(p.I, 30.0)                             # rev 37: integral beku (bukan nol)
         p.update(158.0, 2000, False, 150, 2000, 2000)          # masih > sp + 7: tetap tahan
         self.assertTrue(p.hold)
         p.update(157.0, 3000, False, 150, 3000, 3000)          # <= sp + 7: normal lagi
@@ -341,6 +342,44 @@ class UjiFeedforward(unittest.TestCase):                                  # rev 
         self.assertIn("send('pid,0')", SRC)
         self.assertNotIn("send('pida,", SRC)
         self.assertEqual(SRC.count("pidFfCancel();"), 3)    # pidDisable, pidSafeEnter, TAHAN
+
+
+class UjiTahanIntegralBeku(unittest.TestCase):                       # rev 37
+    def _sim(self, skenario, L=10):
+        a, k = 0.015, 0.015 * 11.0 / 135.0
+        sp = 150.0
+        T = 165.0 if skenario == 2 else sp
+        u0 = k * (T - 30.0) / a
+        p = Pid()
+        hist = [u0] * (L + 1)
+        p.enable(T, 0, False, 165.0 if skenario == 2 else sp, u0)
+        rows = []
+        for i in range(1, 900):
+            T += a * hist[-(L + 1)] - k * (T - 30.0)
+            ukur = T + (14.0 if (skenario == 1 and 100 <= i < 125) else 0.0)   # artefak probe tercelup
+            p.update(ukur, i * 1000, False, sp, i * 1000, i * 1000)
+            hist.append(0.0 if p.hold else p.out)
+            rows.append((i, T))
+        return rows, p
+
+    def test_artefak_sesaat_tidak_menjatuhkan_suhu(self):
+        for L in (10, 30):
+            rows, _ = self._sim(1, L)
+            t_min = min(T for i, T in rows if i >= 100)
+            self.assertGreater(t_min, 145.5, L)                # rev 36 (integral nol): 145.2 / 143.7
+            iae = sum(abs(150 - T) for i, T in rows if i >= 100)
+            self.assertLess(iae, 400, L)                         # rev 36: ~1700
+
+    def test_overshoot_sungguhan_tidak_bertambah(self):
+        for L in (10, 30):
+            rows, _ = self._sim(2, L)
+            self.assertLess(max(T for i, T in rows if i >= 60), 160.5, L)
+            self.assertGreater(min(T for i, T in rows), 148.0, L)   # rev 36: 145.2 / 143.1
+
+    def test_firmware_tidak_menolkan_integral_saat_tahan(self):
+        blok = SRC[SRC.index("  if (pidHold) {"):]
+        blok = blok[:blok.index("return;")]
+        self.assertNotIn("pidI = 0", blok)
 
 
 class UjiAdaptif(unittest.TestCase):

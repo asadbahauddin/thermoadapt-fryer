@@ -1,8 +1,11 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 36)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 37)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 37 (dari rev 36): TAHAN overshoot membekukan integral (dulu dinolkan) -> tidak ada lagi
+ *   penurunan suhu 7-18 C setelah tiap TAHAN (analisis log 31 Okt & 1 Nov, simulasi IAE -58..-89%).
  *
  * REV 36 (dari rev 35): Uji Sistem - Z naik 60% (55% kurang kuat), rentang stabil SP +-3 C
  *   (dulu SP-3..SP+7); tetap harus 30 dtk berturut-turut di rentang sebelum keranjang turun.
@@ -251,7 +254,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 36"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 37"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -615,7 +618,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
     PID hanya MATI bila Anda menekan STOP PID / STOP. Konvensional = gain dasar tetap (tanpa adaptasi).
     Feedforward: saat Uji Sistem menurunkan keranjang, katup ditambah 25% yang meluruh (&tau; 90 dtk), hanya selama suhu &lt; setpoint. TAHAN (katup TUTUP, PID tetap ON, lanjut sendiri):
-    suhu &ge; setpoint+10 &deg;C (lanjut di +7), sensor error &gt;5 dtk, data suhu berhenti.
+    suhu &ge; setpoint+10 &deg;C (lanjut di +7; integral dibekukan, tidak dinolkan), sensor error &gt;5 dtk, data suhu berhenti.
     Tidak ada batas suhu otomatis: gunakan E-stop (harus memutus gas).
     TUTUP = sudut terkecil hasil kalibrasi (di alat ini masih api kecil, bukan padam). Servo BUKAN pemutus gas:
     mematikan api tetap lewat keran/solenoid. Harus ada orang di dekat mesin.</small>
@@ -1534,7 +1537,10 @@ void pidUpdate() {
 
   if (s.held) return;                         // nilai ditahan = bukan pengukuran baru: I & D beku, keluaran tetap
 
-  // rev 24: OVERSHOOT -> katup ditahan TUTUP (api minimum), integral dinolkan, PID TETAP ON.
+  // rev 24: OVERSHOOT -> katup ditahan TUTUP (api minimum), PID TETAP ON.
+  // rev 37: integral DIBEKUKAN (dulu dinolkan). Data 31 Okt-1 Nov: setelah tiap TAHAN suhu jatuh
+  // 7-18 C di bawah SP karena integral (= bukaan tunak ~10%) harus dibangun ulang dari 0 dgn Ki kecil.
+  // Simulasi plant terkalibrasi: IAE -58..-89%, suhu maks tidak bertambah (L 10 & 30 s).
   // TUTUP (-3 derajat) = api sangat kecil yang tidak menaikkan suhu, jadi aman ditahan di sini.
   if (!pidHold && T >= gSetpoint + PID_HOLD_C) {
     pidHold = true;
@@ -1545,7 +1551,7 @@ void pidUpdate() {
     sendMsg("Suhu turun: kontrol PID normal lagi");
   }
   if (pidHold) {
-    pidI = 0; pidOut = 0;
+    pidOut = 0;                               // rev 37: pidI TIDAK dinolkan (beku), dipakai lagi saat lanjut
     pidFfCancel();
     pidPrevT = T; pidDf = 0;
     pidAdaptGains(pidSpEff - T, 0.0f);
