@@ -1,6 +1,6 @@
 """Uji fitur Uji Sistem (rev 33) TANPA hardware:  python uji_sistem.py
 
-1. Cek statis dep_frayer.ino: konstanta sesuai permintaan (rentang SP-3..SP+7, 10 dtk, turun 50%,
+1. Cek statis dep_frayer.ino: konstanta sesuai permintaan (rentang SP-3..SP+7, 30 dtk, turun 50%,
    naik 55%, timer default 120 dtk), urutan tahap, STOP membatalkan, gerak manual ditolak, gerak uji
    tanpa batas waktu, jumlah format snprintf JSON "temp" = jumlah argumen.
 2. Simulasi garis waktu (porting ujUpdate + model mekanik Z/X + limit switch), langkah 10 ms.
@@ -35,7 +35,7 @@ class UjiStatis(unittest.TestCase):
     def test_konstanta_permintaan(self):
         self.assertEqual(d("UJ_BAND_LO_C"), 3.0)
         self.assertEqual(d("UJ_BAND_HI_C"), 7.0)
-        self.assertEqual(d("UJ_STABLE_MS"), 10000)
+        self.assertEqual(d("UJ_STABLE_MS"), 30000)
         self.assertEqual(d("UJ_PCT_DOWN"), 50)
         self.assertEqual(d("UJ_PCT_UP"), 55)
         self.assertEqual(d("UJ_FRY_DEFAULT_S"), 120)
@@ -170,7 +170,7 @@ class SimUji:
                 self.inband = 0
             elif not self.inband:
                 self.inband = now or 1
-            elif now - self.inband >= 10000:
+            elif now - self.inband >= d("UJ_STABLE_MS"):
                 self.enter(4)
         elif st == 5 and now - self.t0 >= self.fry_ms:
             self.enter(6)
@@ -227,7 +227,7 @@ class UjiGarisWaktu(unittest.TestCase):
         sim = SimUji(Fryer(z=100, x=0, temps=temps))
         sim.run(60_000)
         t4 = dict((s, ms) for ms, s in sim.log)[4]
-        self.assertEqual(t4, 36_000)                          # 26 dtk + 10 dtk berturut-turut
+        self.assertEqual(t4, 56_000)                          # 26 dtk + 30 dtk berturut-turut
 
     def test_suhu_di_luar_rentang_tidak_turun(self):
         for suhu in (156.9, 167.1, None):
