@@ -1,8 +1,11 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 37)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 38)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 38 (dari rev 37): integral TIDAK PERNAH dinolkan: dibekukan saat TAHAN AMAN (sensor error/
+ *   data berhenti), diingat saat STOP PID/STOP dan dipakai lagi saat PID ON (berlaku kedua mode).
  *
  * REV 37 (dari rev 36): TAHAN overshoot membekukan integral (dulu dinolkan) -> tidak ada lagi
  *   penurunan suhu 7-18 C setelah tiap TAHAN (analisis log 31 Okt & 1 Nov, simulasi IAE -58..-89%).
@@ -254,7 +257,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 37"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 38"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -618,7 +621,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
     PID hanya MATI bila Anda menekan STOP PID / STOP. Konvensional = gain dasar tetap (tanpa adaptasi).
     Feedforward: saat Uji Sistem menurunkan keranjang, katup ditambah 25% yang meluruh (&tau; 90 dtk), hanya selama suhu &lt; setpoint. TAHAN (katup TUTUP, PID tetap ON, lanjut sendiri):
-    suhu &ge; setpoint+10 &deg;C (lanjut di +7; integral dibekukan, tidak dinolkan), sensor error &gt;5 dtk, data suhu berhenti.
+    suhu &ge; setpoint+10 &deg;C (lanjut di +7). Integral tidak pernah dinolkan: dibekukan saat TAHAN, diingat saat STOP, sensor error &gt;5 dtk, data suhu berhenti.
     Tidak ada batas suhu otomatis: gunakan E-stop (harus memutus gas).
     TUTUP = sudut terkecil hasil kalibrasi (di alat ini masih api kecil, bukan padam). Servo BUKAN pemutus gas:
     mematikan api tetap lewat keran/solenoid. Harus ada orang di dekat mesin.</small>
@@ -1415,6 +1418,7 @@ bool  pidAdapt = PID_ADAPT_DEFAULT;                                       // rev
 float pidLp = PID_DEFAULT_LP, pidLi = PID_DEFAULT_LI, pidLd = PID_DEFAULT_LD;   // lambda_p, lambda_i, lambda_d
 float pidKpEff = PID_DEFAULT_KP, pidKiEff = PID_DEFAULT_KI, pidKdEff = PID_DEFAULT_KD;  // gain yang SEDANG dipakai
 float pidI = 0;                   // suku integral (persen bukaan)
+float pidIMem = 0;                // rev 38: integral terakhir saat PID di-STOP, dipakai lagi saat PID ON
 float pidOut = 0;                 // keluaran terakhir (persen bukaan, 0..Umax)
 float pidSpEff = 0;               // setpoint efektif (dengan ramp)
 float pidPrevT = 0, pidDf = 0;    // untuk derivatif pada pengukuran
@@ -1441,7 +1445,8 @@ void pidAdaptGains(float e, float dTdt);   // didefinisikan di bawah
 
 void pidDisable(const char* why) {
   bool was = pidOn;
-  pidOn = false; pidOut = 0; pidI = 0;
+  if (pidOn) pidIMem = pidI;                 // rev 38: integral DIINGAT (tidak dibuang) untuk PID ON berikutnya
+  pidOn = false; pidOut = 0;
   pidFfCancel();
   pidAdaptGains(0.0f, 0.0f);                 // rev 17: gain dipakai kembali = gain dasar
   setServoAngle((float)svClosedDeg);         // katup ke TUTUP (api minimum hasil kalibrasi)
@@ -1451,7 +1456,7 @@ void pidDisable(const char* why) {
 // rev 27: TAHAN AMAN (pengganti pidDisable otomatis). Pesan & buzzer hanya saat masuk/ganti alasan.
 void pidSafeEnter(uint8_t why, const char* msg) {
   if (pidSafeWhy != why) { pidSafeWhy = why; sendMsg(msg); buzzPlay(3); }
-  pidI = 0; pidOut = 0; pidPrevValid = false;
+  pidOut = 0; pidPrevValid = false;          // rev 38: integral DIBEKUKAN (dulu dinolkan), lanjut saat normal
   pidFfCancel();
   setServoAngle((float)svClosedDeg);         // katup TUTUP (api minimum)
 }
@@ -1483,7 +1488,10 @@ void pidEnable() {
   pidHold = false;
   pidSafeWhy = 0;
   pidAdaptGains(0.0f, 0.0f);                  // gain efektif = gain dasar saat start
-  pidI = constrain(servoOpeningPct(), 0.0f, pidUmax);   // start tanpa loncatan (e = 0 saat start)
+  // rev 38: integral awal = integral terakhir sebelum STOP (bukaan tunak), atau bukaan katup sekarang
+  // bila lebih besar. Dulu = bukaan katup saja, yang setelah STOP selalu 0% -> PID butuh menit-an
+  // untuk membangun ulang bukaan tunak (~10%) dgn Ki kecil.
+  pidI = constrain(fmaxf(servoOpeningPct(), pidIMem), 0.0f, pidUmax);
   pidOut = pidI;
   pidDf = 0;
   pidLastMs = s.ms;

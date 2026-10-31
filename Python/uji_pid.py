@@ -40,6 +40,7 @@ class Pid:
         self.last_ms = 0
         self.alasan_mati = None
         self.ff_on, self.ff_ms, self.ff = False, 0, 0.0      # rev 34: feedforward beban
+        self.I_mem = 0.0                                     # rev 38: integral terakhir saat STOP
 
     def ff_start(self, ms):                              # pidFfStart (dipanggil di tahap 4 Uji Sistem)
         if FF_PCT > 0 and self.on:
@@ -58,12 +59,14 @@ class Pid:
 
     def safe_enter(self, why):                           # rev 27: pidSafeEnter
         self.safe = why
-        self.I = self.out = 0.0
+        self.out = 0.0                                   # rev 38: integral dibekukan
         self.prev_valid = False
         self.ff_cancel()
 
     def disable(self, why):
-        self.on, self.out, self.I = False, 0.0, 0.0
+        if self.on:
+            self.I_mem = self.I                          # rev 38: integral diingat
+        self.on, self.out = False, 0.0
         self.ff_cancel()
         self.alasan_mati = why
 
@@ -71,7 +74,7 @@ class Pid:
         self.hold = False
         self.safe = 0
         self.gains(0.0, 0.0)
-        self.I = min(max(opening_pct, 0.0), self.umax)
+        self.I = min(max(opening_pct, self.I_mem, 0.0), self.umax)   # rev 38
         self.out = self.I
         self.df = 0.0
         self.last_ms = ms
@@ -380,6 +383,33 @@ class UjiTahanIntegralBeku(unittest.TestCase):                       # rev 37
         blok = SRC[SRC.index("  if (pidHold) {"):]
         blok = blok[:blok.index("return;")]
         self.assertNotIn("pidI = 0", blok)
+
+
+class UjiIntegralTidakDinolkan(unittest.TestCase):                    # rev 38
+    def test_stop_lalu_on_memakai_integral_terakhir(self):
+        p = Pid(); p.enable(150.0, 0, False, 150.0, 0.0)
+        p.I = 11.0
+        p.disable("STOP")
+        self.assertEqual(p.out, 0.0)                                # katup TUTUP saat STOP
+        p.enable(140.0, 10_000, False, 150.0, 0.0)                  # katup 0% setelah STOP
+        self.assertEqual((p.I, p.out), (11.0, 11.0))                # dulu 0 -> menit-an membangun ulang
+
+    def test_bukaan_lebih_besar_tetap_dipakai(self):
+        p = Pid(); p.I_mem = 5.0
+        p.enable(140.0, 0, False, 150.0, 20.0)
+        self.assertEqual(p.I, 20.0)
+
+    def test_tahan_aman_sensor_membekukan_integral(self):
+        p = Pid(); p.enable(150.0, 0, False, 150.0, 12.0)
+        p.update(float("nan"), 6000, False, 150.0, 6000, 0)         # sensor error > 5 dtk
+        self.assertEqual((p.safe, p.out, p.I), (2, 0.0, 12.0))
+
+    def test_firmware_tidak_ada_pidI_nol(self):
+        import re
+        kode = re.sub(r"//[^\n]*", "", SRC)
+        kode = re.sub(r"/\*.*?\*/", "", kode, flags=re.S)
+        self.assertNotRegex(kode, r"(?<!float )pidI\s*=\s*0\s*;")   # deklarasi awal boleh
+        self.assertIn("pidIMem = pidI", kode)
 
 
 class UjiAdaptif(unittest.TestCase):
