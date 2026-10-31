@@ -262,5 +262,27 @@ class UjiParser(unittest.TestCase):
         self.assertIsNone(r["uji_tahap"])
 
 
+class UjiBandingkan(unittest.TestCase):                               # rev 34: bandingkan_pid.py
+    def test_metrik_siklus_sintetis(self):
+        import tempfile
+        import pandas as pd
+        from bandingkan_pid import siklus_dari_csv
+        t = list(range(0, 300))
+        tahap = [3] * 50 + [4] * 10 + [5] * 120 + [6] * 10 + [7] * 10 + [8] * 100
+        suhu = [160.0] * 50 + [160 - i for i in range(10)] + [150 + i * 0.1 for i in range(120)] + [162.0] * 120
+        df = pd.DataFrame(dict(elapsed_s=t, uji_tahap=tahap, suhu_c=suhu, setpoint_c=160.0,
+                               pid_adaptif=0, servo_bukaan_pct=20.0, pid_ff_pct=25.0))
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.csv")
+            df.to_csv(p, index=False)
+            sk = siklus_dari_csv(p)
+        self.assertEqual(len(sk), 1)
+        s = sk[0]
+        self.assertEqual(s["mode"], "KONVENSIONAL")
+        self.assertAlmostEqual(s["turun_maks"], 10.0, places=1)     # 160 - 150 (sampel terendah)
+        self.assertEqual(s["durasi_s"], 130)                          # tahap 4 (t=50) .. tahap 6 (t=180)
+        self.assertAlmostEqual(s["pulih_s"], 70.0, delta=1.5)        # 150 -> 157 (SP-3) pada 0.1 C/s
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

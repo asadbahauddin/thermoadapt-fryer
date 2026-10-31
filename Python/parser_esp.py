@@ -4,7 +4,8 @@ Firmware mengirim 3 jenis pesan JSON:
   temp (1 Hz) : t, ok, f, raw, d, up, sp, seq, ms, st, te (rev 14), tr, held, ec (rev 15),
                 pe, pu, se (rev 16: PID aktif, keluaran %, setpoint efektif),
                 kpe, kie, kde (rev 17: gain yang SEDANG dipakai, adaptif), ph (rev 24: tahan overshoot),
-                uj, us, uf (rev 33: tahap Uji Sistem, detik tahap/sisa timer, timer goreng)
+                uj, us, uf (rev 33: tahap Uji Sistem, detik tahap/sisa timer, timer goreng),
+                pf, am (rev 34: feedforward beban %, mode PID 1 adaptif / 0 konvensional)
                 t = suhu tersaring (rev 21: median-5 -> moving avg-5 -> EMA, + hold), tr = mentah
   st   (4 Hz) : ls[4], raw[4], vr[4], il[4], pn[4], bn, dx, xp, xm, en, sx, ax,
                 sa, sg, sr, sl, um, ux, cd, od, tc, dcc, dct, dcm, dcv, sp,
@@ -37,7 +38,7 @@ KOLOM = (
      # PID (rev 16): kosong bila firmware lama
      # kp/ki/kd = gain yang SEDANG dipakai (berubah tiap sampel saat adaptif); kp0.. = gain dasar
      "pid_aktif", "pid_tahan", "pid_output_pct", "setpoint_efektif_c", "kp", "ki", "kd", "pid_umax_pct",
-     "pid_adaptif", "kp0", "ki0", "kd0", "lambda_p", "lambda_i", "lambda_d",
+     "pid_adaptif", "pid_ff_pct", "kp0", "ki0", "kd0", "lambda_p", "lambda_i", "lambda_d",
      "servo_sudut_deg", "servo_target_deg", "servo_bukaan_pct", "servo_target_pct",
      "servo_pulsa_mentah_us", "servo_kunci", "servo_tutup_deg", "servo_buka_deg",
      "dc_out_pct", "dc_target_pct", "dc_duty_maks_pct", "dc_supply_v", "dc_v_rata",
@@ -165,6 +166,7 @@ class Penggabung:
         r["uji_tahap"] = _bulat(m.get("uj"))              # rev 33: kosong bila firmware lama
         r["uji_detik"] = _bulat(m.get("us"))
         r["uji_timer_s"] = _bulat(m.get("uf"))
+        r["pid_ff_pct"] = _angka(m.get("pf"))             # rev 34: feedforward beban (%)
         r["pid_aktif"] = _bulat(m.get("pe"))
         r["pid_output_pct"] = _angka(m.get("pu"))
         r["pid_tahan"] = _bulat(m.get("ph"))              # 1 = overshoot, katup ditahan TUTUP
@@ -213,7 +215,7 @@ class Penggabung:
             r["kp0"] = _angka(s.get("kp"))                    # gain DASAR (rev 17)
             r["ki0"] = _angka(s.get("ki"))
             r["kd0"] = _angka(s.get("kd"))
-            r["pid_adaptif"] = _bulat(s.get("ad"))
+            r["pid_adaptif"] = _bulat(m.get("am")) if _angka(m.get("am")) is not None else _bulat(s.get("ad"))   # rev 34: mode dari sampel temp
             r["lambda_p"] = _angka(s.get("lp"))
             r["lambda_i"] = _angka(s.get("li"))
             r["lambda_d"] = _angka(s.get("ld"))

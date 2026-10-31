@@ -1,8 +1,14 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 33)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 34)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 34 (dari rev 33): TOMBOL MODE PID + FEEDFORWARD BEBAN (analisis log 31 Okt)
+ *   - Web: PID ADAPTIF ON ("pidm,1"), PID KONVENSIONAL ON ("pidm,0", gain dasar tetap), STOP PID.
+ *   - Feedforward beban keripik: saat Uji Sistem menurunkan keranjang, keluaran + 25% meluruh
+ *     (tau 90 dtk), ditahan saat suhu >= setpoint, batal saat TAHAN/PID mati. Gain dasar TIDAK
+ *     diubah (identifikasi closed-loop: sudah di rentang SIMC). JSON temp: pf (FF %), am (mode).
  *
  * REV 33 (dari rev 32): UJI SISTEM / UJI KEMATANGAN OTOMATIS (perintah "uj,<detik>")
  *   - Z naik ke Z Atas -> X ke X Awal -> suhu di SP-3..SP+7 selama 10 dtk -> Z turun 50% sampai
@@ -239,7 +245,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 33"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 34"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -387,6 +393,13 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 #define PID_HOLD_HYST_C    3.0f      //   keluar dari tahan bila suhu <= setpoint + HOLD - HYST
                                      // PID baru MATI total bila suhu >= TEMP_CUTOFF_C (batas akhir)
 #define PID_D_FILTER       0.8f      // filter derivatif orde-1 (0..1; makin besar makin halus)
+// rev 34: FEEDFORWARD BEBAN KERIPIK (Uji Sistem). Saat keranjang mulai turun (tahap 4), keluaran
+// ditambah FF = PID_FF_PCT * exp(-t / PID_FF_TAU_S). Sama untuk mode adaptif & konvensional.
+// FF ditahan (= 0) selama suhu >= setpoint efektif dan dibatalkan saat TAHAN overshoot/PID mati.
+// Simulasi plant terkalibrasi data 31 Okt (a 0.015 C/s per %, beban SP150 turun ke 137 C):
+// suhu terendah 136.3 -> 142.2 C, IAE -29%, suhu maks +0.4 C (L 10 s); tetap aman pada L 30 s.
+#define PID_FF_PCT         25.0f     // 0 = feedforward MATI
+#define PID_FF_TAU_S       90.0f
 
 // ---- ADAPTIVE PID (rev 17), hukum adaptasi SAMA dgn model Simulink (build_deep_fryer_model.m) ----
 //   Kp(k) = min(Kp0 + lambda_p*|e(k)|,     max(Kp0, PID_KP_MAX))
@@ -565,7 +578,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <input id="spin" type="text" inputmode="decimal" placeholder="mis. 160"
              onkeydown="if(event.key==='Enter')sendSp()">
       <button onclick="sendSp()">Set</button></div>
-    <div><small>Cara uji: isi setpoint &rarr; Set &rarr; klik <b>MULAI KONTROL</b> di kotak PID Suhu.</small></div>
+    <div><small>Cara uji: isi setpoint &rarr; Set &rarr; klik <b>PID ADAPTIF ON</b> atau <b>PID KONVENSIONAL ON</b> di kotak PID Suhu.</small></div>
     <small>Setpoint bebas, TANPA batas suhu otomatis (pakai E-stop bila perlu). Setpoint &gt; 200 &deg;C
     minta konfirmasi untuk mencegah salah ketik.</small>
   </div>
@@ -574,18 +587,16 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <h2>PID Suhu</h2>
     <div class="pos"><span id="pids" class="err">PID mati</span>
       <small>&nbsp; keluaran <b id="pidu">0.0</b>% &nbsp; setpoint efektif <b id="pide">--</b> &deg;C</small></div>
-    <button onclick="send('pid,1')" style="font-size:1.1em">MULAI KONTROL (PID ON)</button>
-    <button onclick="send('pid,0')" style="font-size:1.1em">BERHENTI KONTROL (PID OFF)</button>
-    <button class="stop" onclick="send('stop')" style="width:auto">STOP</button>
+    <button onclick="send('pidm,1')" style="font-size:1.1em">PID ADAPTIF ON</button>
+    <button onclick="send('pidm,0')" style="font-size:1.1em">PID KONVENSIONAL ON</button>
+    <button class="stop" onclick="send('pid,0')" style="font-size:1.1em;width:auto">STOP PID</button>
     <div style="margin-top:8px">
       Kp <input id="pkp" type="number" step="0.1" min="0" max="50">
       Ki <input id="pki" type="number" step="0.001" min="0" max="5">
       Kd <input id="pkd" type="number" step="0.1" min="0" max="200">
       Umax <input id="pum" type="number" step="1" min="5" max="100"> %
       <button onclick="pidSet()">Simpan</button></div>
-    <div style="margin-top:8px">Mode: <b id="pada">--</b>
-      <button onclick="send('pida,1')">ADAPTIF ON</button>
-      <button onclick="send('pida,0')">ADAPTIF OFF (PID biasa)</button></div>
+    <div style="margin-top:8px">Mode: <b id="pada">--</b> &nbsp; <small>feedforward beban <b id="pff">0</b>%</small></div>
     <div style="margin-top:6px">
       &lambda;p <input id="plp" type="number" step="0.01" min="0" max="1">
       &lambda;i <input id="pli" type="number" step="0.0001" min="0" max="0.01">
@@ -596,7 +607,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     dibatasi Kp &le; 3, Ki &le; 0,065, Kd &le; 5 (atau nilai dasar bila lebih besar). Kp/Ki/Kd di atas = nilai DASAR.</small><br>
     <small>u = Kp&middot;e + &int;Ki&middot;e + D (D pada pengukuran). Satuan: % bukaan per &deg;C. Ki = Kp/Ti.
     Setpoint diatur di kotak Suhu Minyak. Setpoint efektif naik bertahap 0,15 &deg;C/dtk.
-    PID hanya MATI bila Anda menekan PID OFF / STOP. TAHAN (katup TUTUP, PID tetap ON, lanjut sendiri):
+    PID hanya MATI bila Anda menekan STOP PID / STOP. Konvensional = gain dasar tetap (tanpa adaptasi).
+    Feedforward: saat Uji Sistem menurunkan keranjang, katup ditambah 25% yang meluruh (&tau; 90 dtk), hanya selama suhu &lt; setpoint. TAHAN (katup TUTUP, PID tetap ON, lanjut sendiri):
     suhu &ge; setpoint+10 &deg;C (lanjut di +7), sensor error &gt;5 dtk, data suhu berhenti.
     Tidak ada batas suhu otomatis: gunakan E-stop (harus memutus gas).
     TUTUP = sudut terkecil hasil kalibrasi (di alat ini masih api kecil, bukan padam). Servo BUKAN pemutus gas:
@@ -977,7 +989,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (typeof m.uj === 'number') ujFeed(m);
       if (typeof m.pe === 'number') {
         const TAHAN = {1:'overshoot', 2:'SENSOR ERROR', 3:'SUHU >= 180 C', 4:'DATA SUHU BERHENTI'};
-        $('pids').textContent = m.pe ? (m.ph ? 'PID AKTIF - TAHAN AMAN (' + (TAHAN[m.ph] || m.ph) + ', katup TUTUP)' : 'PID AKTIF') : 'PID mati';
+        const MODE = (typeof m.am === 'number') ? (m.am ? ' ADAPTIF' : ' KONVENSIONAL') : '';
+        $('pids').textContent = m.pe ? (m.ph ? 'PID' + MODE + ' AKTIF - TAHAN AMAN (' + (TAHAN[m.ph] || m.ph) + ', katup TUTUP)' : 'PID' + MODE + ' AKTIF') : 'PID mati';
+        if (typeof m.pf === 'number') $('pff').textContent = m.pf.toFixed(1);
         $('pids').className = m.pe ? 'ok' : 'err';
         $('pidu').textContent = m.pu.toFixed(1);
         $('pide').textContent = (m.pe && typeof m.se === 'number') ? m.se.toFixed(1) : '--';
@@ -1002,7 +1016,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       // Umax memakai key "pm"; "um" tetap pulsa servo 0 derajat (kotak tersembunyi sumin)
       if (typeof m.kp === 'number') { setField('pkp', m.kp); setField('pki', m.ki); setField('pkd', m.kd); setField('pum', m.pm); }
       if (typeof m.ad === 'number') {
-        $('pada').textContent = m.ad ? 'ADAPTIVE PID' : 'PID BIASA'; $('pada').className = m.ad ? 'ok' : '';
+        $('pada').textContent = m.ad ? 'PID ADAPTIF' : 'PID KONVENSIONAL (gain dasar tetap)'; $('pada').className = m.ad ? 'ok' : '';
         setField('plp', m.lp); setField('pli', m.li); setField('pld', m.ld);
       }
 
@@ -1402,6 +1416,12 @@ bool  pidHold = false;            // rev 24: overshoot -> katup ditahan TUTUP, P
 //   1 overshoot (>= sp + 10)   2 sensor error > 5 dtk   3 suhu >= 180 C   4 data suhu berhenti   5 setpoint > batas
 uint8_t pidSafeWhy = 0;
 uint32_t pidLastMs = 0;
+bool     pidFfOn = false;         // rev 34: feedforward beban sedang berjalan
+uint32_t pidFfMs = 0;             //   waktu mulai FF
+float    pidFf = 0;               //   FF yang dipakai sampel terakhir (persen, untuk web/logger)
+
+void pidFfStart() { if (PID_FF_PCT > 0 && pidOn) { pidFfOn = true; pidFfMs = millis(); } }
+void pidFfCancel() { pidFfOn = false; pidFf = 0; }
 
 float servoOpeningPct() {         // bukaan servo sekarang (target) dalam persen TUTUP..BUKA
   float span = (float)(svOpenDeg - svClosedDeg);
@@ -1413,6 +1433,7 @@ void pidAdaptGains(float e, float dTdt);   // didefinisikan di bawah
 void pidDisable(const char* why) {
   bool was = pidOn;
   pidOn = false; pidOut = 0; pidI = 0;
+  pidFfCancel();
   pidAdaptGains(0.0f, 0.0f);                 // rev 17: gain dipakai kembali = gain dasar
   setServoAngle((float)svClosedDeg);         // katup ke TUTUP (api minimum hasil kalibrasi)
   if (was && why) { sendMsg(why); buzzPlay(3); }
@@ -1422,6 +1443,7 @@ void pidDisable(const char* why) {
 void pidSafeEnter(uint8_t why, const char* msg) {
   if (pidSafeWhy != why) { pidSafeWhy = why; sendMsg(msg); buzzPlay(3); }
   pidI = 0; pidOut = 0; pidPrevValid = false;
+  pidFfCancel();
   setServoAngle((float)svClosedDeg);         // katup TUTUP (api minimum)
 }
 
@@ -1518,6 +1540,7 @@ void pidUpdate() {
   }
   if (pidHold) {
     pidI = 0; pidOut = 0;
+    pidFfCancel();
     pidPrevT = T; pidDf = 0;
     pidAdaptGains(pidSpEff - T, 0.0f);
     setServoAngle((float)svClosedDeg);
@@ -1530,7 +1553,14 @@ void pidUpdate() {
   pidDf = PID_D_FILTER * pidDf + (1.0f - PID_D_FILTER) * dRaw;
 
   pidAdaptGains(e, pidDf);                    // rev 17: Kp/Ki/Kd efektif dari |e| dan |dT/dt|
-  float uUnsat = pidKpEff * e + pidI - pidKdEff * pidDf;
+  pidFf = 0;                                  // rev 34: feedforward beban (lihat PID_FF_PCT)
+  if (pidFfOn) {
+    float tf = (float)(int32_t)(s.ms - pidFfMs) / 1000.0f;   // bertanda: sampel bisa sedikit lebih tua dari mulai FF
+    if (tf < 0.0f) tf = 0.0f;
+    if (tf > 5.0f * PID_FF_TAU_S) pidFfOn = false;
+    else if (T < pidSpEff) pidFf = PID_FF_PCT * expf(-tf / PID_FF_TAU_S);
+  }
+  float uUnsat = pidKpEff * e + pidI - pidKdEff * pidDf + pidFf;
   float u = constrain(uUnsat, 0.0f, pidUmax);
   bool windup = (uUnsat > pidUmax && e > 0) || (uUnsat < 0.0f && e < 0);     // integrasi bersyarat
   if (!windup) pidI = constrain(pidI + pidKiEff * e * dt, 0.0f, pidUmax);
@@ -1621,7 +1651,7 @@ void ujEnter(uint8_t st) {
     case 1: if (!lsHit(LS_ZATAS)) { ujMoveZ(UJ_PCT_UP); sendMsg("Uji: Z naik ke Z Atas"); } break;
     case 2: if (!lsHit(LS_XAWAL)) { ujMoveX(-1); sendMsg("Uji: X ke X Awal"); } break;
     case 3: ujInBandMs = 0; sendMsg("Uji: menunggu suhu dekat setpoint (10 dtk)"); break;
-    case 4: ujMoveZ(-UJ_PCT_DOWN); sendMsg("Uji: Z TURUN"); break;
+    case 4: ujMoveZ(-UJ_PCT_DOWN); pidFfStart(); sendMsg("Uji: Z TURUN"); break;
     case 5: buzzPlay(1); sendMsg("Uji: Z Bawah kena - TIMER GORENG mulai"); break;
     case 6: buzzPlay(1); ujMoveZ(UJ_PCT_UP); sendMsg("Uji: timer habis - Z NAIK"); break;
     case 7: ujMoveX(1); sendMsg("Uji: X ke X Akhir"); break;
@@ -1723,6 +1753,17 @@ void handleCommand(const char* cmd) {
 #endif
     gLcdResetReq = true;
     sendMsg("Reset LCD diminta");
+    return;
+  }
+  // ---- rev 34: "pidm,<1|0>" = PID ADAPTIF ON / PID KONVENSIONAL ON (pilih mode + nyalakan).
+  // Konvensional = gain dasar Kp0/Ki0/Kd0 tetap. Ganti mode saat PID jalan: tanpa loncatan
+  // (integral dalam satuan keluaran), berlaku di sampel berikutnya.
+  if (sscanf(cmd, "pidm,%d", &v) == 1) {
+    pidAdapt = (v != 0);
+    if (!pidOn) pidAdaptGains(0.0f, 0.0f);
+    pidSave();
+    if (!pidOn) pidEnable();
+    sendMsg(pidAdapt ? "PID ADAPTIF ON" : "PID KONVENSIONAL ON (gain dasar tetap)");
     return;
   }
   // ---- rev 17: "pida,<0|1>" adaptif ON/OFF (OFF = PID biasa, untuk pembanding) ----
@@ -1900,13 +1941,14 @@ void broadcastTemp() {
   bool pe = pidOn;
   char ses[16];
   if (pe) snprintf(ses, sizeof(ses), "%.2f", pidSpEff); else strcpy(ses, "null");
-  char b[600];
+  char b[700];
+  // rev 34: pf = feedforward beban (%), am = mode PID (1 adaptif, 0 konvensional)
   // rev 33: uj = tahap Uji Sistem, us = detik tahap (tahap 5 = SISA timer), uf = timer goreng (dtk)
   // sp, seq, ms (rev 12): setpoint, nomor urut sampel, waktu sampel ESP32 (ms)
-  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d,\"uj\":%d,\"us\":%ld,\"uf\":%lu}",
-                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0, (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL));
-  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d,\"uj\":%d,\"us\":%ld,\"uf\":%lu}",
-                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0, (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL));
+  if (isnan(t)) snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":null,\"ok\":false,\"f\":%d,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d,\"uj\":%d,\"us\":%ld,\"uf\":%lu,\"pf\":%.1f,\"am\":%d}",
+                         (int)gFault, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0, (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL), pidFf, (int)pidAdapt);
+  else          snprintf(b, sizeof(b), "{\"type\":\"temp\",\"t\":%.2f,\"ok\":true,\"raw\":\"%08lX\",\"d\":\"%s\",\"up\":%lu,\"sp\":%.1f,\"seq\":%lu,\"ms\":%lu,\"st\":%d,\"te\":%lu,\"tr\":%s,\"held\":%d,\"ec\":%lu,\"pe\":%d,\"pu\":%.2f,\"se\":%s,\"kpe\":%.4f,\"kie\":%.5f,\"kde\":%.4f,\"ph\":%d,\"uj\":%d,\"us\":%ld,\"uf\":%lu,\"pf\":%.1f,\"am\":%d}",
+                         t, (unsigned long)r, d, millis() / 1000, sp, seq, ms, (int)stState, (unsigned long)stElapsedS(), trs, held, ec, (int)pe, pidOut, ses, pidKpEff, pidKiEff, pidKdEff, pe ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0, (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL), pidFf, (int)pidAdapt);
   ws.broadcastTXT(b);
 }
 

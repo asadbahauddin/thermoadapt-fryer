@@ -24,6 +24,7 @@ SP_MAX = CUTOFF - 15
 CUTOFF_ON = bool(int(re.search(r"#define\s+PID_CUTOFF_ENABLE\s+(\d)", SRC).group(1)))   # rev 30
 LP, LI, LD = c("PID_DEFAULT_LP"), c("PID_DEFAULT_LI"), c("PID_DEFAULT_LD")
 KP_MAX, KI_MAX, KD_MAX = c("PID_KP_MAX"), c("PID_KI_MAX"), c("PID_KD_MAX")
+FF_PCT, FF_TAU = c("PID_FF_PCT"), c("PID_FF_TAU_S")                   # rev 34
 
 
 class Pid:
@@ -38,6 +39,14 @@ class Pid:
         self.prev_valid = False
         self.last_ms = 0
         self.alasan_mati = None
+        self.ff_on, self.ff_ms, self.ff = False, 0, 0.0      # rev 34: feedforward beban
+
+    def ff_start(self, ms):                              # pidFfStart (dipanggil di tahap 4 Uji Sistem)
+        if FF_PCT > 0 and self.on:
+            self.ff_on, self.ff_ms = True, ms
+
+    def ff_cancel(self):
+        self.ff_on, self.ff = False, 0.0
 
     def gains(self, e, dTdt):
         if not self.adapt:
@@ -51,9 +60,11 @@ class Pid:
         self.safe = why
         self.I = self.out = 0.0
         self.prev_valid = False
+        self.ff_cancel()
 
     def disable(self, why):
         self.on, self.out, self.I = False, 0.0, 0.0
+        self.ff_cancel()
         self.alasan_mati = why
 
     def enable(self, t, ms, held, setpoint, opening_pct):   # rev 28: SELALU berhasil
@@ -105,6 +116,7 @@ class Pid:
             self.hold = False
         if self.hold:
             self.I = self.out = 0.0
+            self.ff_cancel()
             self.prev_t, self.df = t, 0.0
             self.gains(self.sp_eff - t, 0.0)
             return
@@ -115,7 +127,14 @@ class Pid:
         self.prev_t = t
         self.df = DF * self.df + (1 - DF) * d_raw
         self.gains(e, self.df)
-        u_unsat = self.kpe * e + self.I - self.kde * self.df
+        self.ff = 0.0
+        if self.ff_on:
+            tf = max((ms - self.ff_ms) / 1000.0, 0.0)
+            if tf > 5.0 * FF_TAU:
+                self.ff_on = False
+            elif t < self.sp_eff:
+                self.ff = FF_PCT * math.exp(-tf / FF_TAU)
+        u_unsat = self.kpe * e + self.I - self.kde * self.df + self.ff
         u = min(max(u_unsat, 0.0), self.umax)
         windup = (u_unsat > self.umax and e > 0) or (u_unsat < 0 and e < 0)
         if not windup:
@@ -250,6 +269,78 @@ class UjiPid(unittest.TestCase):
         p.update(float("nan"), 2000, False, 150, 2000, 1000)
         p.update(104, 3000, False, 150, 3000, 3000)          # suhu loncat 4 C setelah NAN
         self.assertEqual(p.df, 0.0)
+
+
+def sim_beban(ff=True, adapt=True, L=10, sp=150.0, dur=400, t_load=60):
+    """Plant terkalibrasi data 31 Okt: dT/dt = a*u(t-L) - c*(T-30) - beban keripik
+    (a 0.015 C/s per %, u tunak 11% pada 165 C; beban 0.6 C/s meluruh 180 s, mereproduksi
+    siklus SP150 nyata: turun ke ~137 C, +180 s ~146 C). FF mulai saat Z mulai turun (t_load-10)."""
+    a = 0.015
+    k = a * 11.0 / (165.0 - 30.0)
+    pid = Pid(adapt=adapt)
+    T = sp
+    u0 = k * (T - 30.0) / a
+    hist = [u0] * (L + 1)
+    pid.enable(T, 0, False, sp, u0)
+    rows = []
+    for i in range(1, dur):
+        q = 0.6 * math.exp(-(i - t_load) / 180.0) if i >= t_load else 0.0
+        T += a * hist[-(L + 1)] - k * (T - 30.0) - q
+        if ff and i == t_load - 10:
+            pid.ff_start(i * 1000)
+        pid.update(T, i * 1000, False, sp, i * 1000, i * 1000)
+        hist.append(pid.out)
+        rows.append((i, T, pid.out, pid.ff))
+    return rows
+
+
+class UjiFeedforward(unittest.TestCase):                                  # rev 34
+    def test_ff_menaikkan_suhu_terendah_tanpa_overshoot(self):
+        for adapt in (True, False):
+            for L in (10, 30):
+                tanpa = sim_beban(ff=False, adapt=adapt, L=L)
+                pakai = sim_beban(ff=True, adapt=adapt, L=L)
+                tmin0, tmin1 = min(r[1] for r in tanpa), min(r[1] for r in pakai)
+                tmax0, tmax1 = max(r[1] for r in tanpa), max(r[1] for r in pakai)
+                iae0 = sum(abs(150 - r[1]) for r in tanpa)
+                iae1 = sum(abs(150 - r[1]) for r in pakai)
+                self.assertGreater(tmin1, tmin0 + 3, (adapt, L))
+                self.assertLess(iae1, iae0 * 0.85, (adapt, L))
+                self.assertLess(tmax1, tmax0 + 2.5, (adapt, L))
+                if L == 10:
+                    print("\n  [plant terkalibrasi] %-12s L=%d: suhu terendah %.1f -> %.1f C, IAE %.0f -> %.0f, maks %.1f -> %.1f"
+                          % ("adaptif" if adapt else "konvensional", L, tmin0, tmin1, iae0, iae1, tmax0, tmax1))
+
+    def test_ff_ditahan_saat_suhu_di_atas_setpoint(self):
+        p = Pid(adapt=False)
+        p.enable(155.0, 0, False, 150.0, 10.0)
+        p.sp_eff = 150.0
+        p.ff_start(0)
+        p.update(155.0, 1000, False, 150.0, 1000, 1000)
+        self.assertEqual(p.ff, 0.0)
+        self.assertTrue(p.ff_on)                            # tidak dibatalkan, hanya ditahan
+        p.update(149.0, 2000, False, 150.0, 2000, 2000)
+        self.assertAlmostEqual(p.ff, FF_PCT * math.exp(-2.0 / FF_TAU), places=4)
+
+    def test_ff_batal_saat_tahan_overshoot_dan_meluruh(self):
+        p = Pid()
+        p.enable(140.0, 0, False, 150.0, 10.0)
+        p.ff_start(0)
+        p.update(161.0, 1000, False, 150.0, 1000, 1000)     # >= sp + 10 -> TAHAN
+        self.assertFalse(p.ff_on)
+        q = Pid(); q.enable(140.0, 0, False, 150.0, 10.0); q.ff_start(0)
+        for i in range(1, int(5 * FF_TAU) + 3):
+            q.update(140.0, i * 1000, False, 150.0, i * 1000, i * 1000)
+        self.assertFalse(q.ff_on)                            # habis setelah 5 tau
+
+    def test_firmware_ff_dipicu_saat_z_turun_dan_mode_pidm(self):
+        self.assertIn("case 4: ujMoveZ(-UJ_PCT_DOWN); pidFfStart();", SRC)
+        self.assertRegex(SRC, r'sscanf\(cmd, "pidm,%d", &v\) == 1')
+        self.assertIn("send('pidm,1')", SRC)
+        self.assertIn("send('pidm,0')", SRC)
+        self.assertIn("send('pid,0')", SRC)
+        self.assertNotIn("send('pida,", SRC)
+        self.assertEqual(SRC.count("pidFfCancel();"), 3)    # pidDisable, pidSafeEnter, TAHAN
 
 
 class UjiAdaptif(unittest.TestCase):
