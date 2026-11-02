@@ -15,3 +15,6 @@ __pycache__/
 
 # salinan versi lama untuk uji A/B (tidak di-commit)
 arsip/
+
+# naskah jurnal (belum terbit: jangan publik agar tidak terdeteksi plagiasi saat cek kemiripan)
+Jurnal/
