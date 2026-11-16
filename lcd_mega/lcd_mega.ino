@@ -5,7 +5,8 @@
  * WIRING
  *   ESP32 GPIO22 (TX2) -> Mega pin 19 (RX1)      115200 bps, 8N1
  *   ESP32 GND          -> Mega GND               (WAJIB, ground bersama)
- *   LCD TFT ILI9488 3.5" SPI (logika 3,3 V!) lewat level shifter 5 V -> 3,3 V (mis. 74HC4050 / TXS0108E):
+ *   LCD TFT ILI9488 3.5" SPI (logika 3,3 V!) lewat level shifter 5 V -> 3,3 V (modul bidirectional BSS138
+ *   HV=5V, LV=3V3; atau 74HC4050 / TXS0108E):
  *     Mega 52 (SCK)  -> LCD SCK
  *     Mega 51 (MOSI) -> LCD SDI(MOSI)
  *     Mega 49        -> LCD CS
@@ -28,6 +29,7 @@
 #define PIN_TFT_DC   48
 #define PIN_TFT_RST  47
 #define LINK_BAUD    115200
+#define LCD_SPI_HZ   2000000UL     // 2 MHz: aman lewat modul level converter BSS138; naikkan ke 8000000 bila pakai 74HC4050/TXS0108E
 #define LINK_TIMEOUT_MS 3000UL     // tanpa bingkai valid > 3 dtk -> tampil "TIDAK ADA DATA"
 
 Arduino_DataBus *bus = new Arduino_HWSPI(PIN_TFT_DC, PIN_TFT_CS);
@@ -263,7 +265,7 @@ void setup() {
   pinMode(53, OUTPUT);                 // SS harus OUTPUT agar SPI tetap master
   Serial.begin(115200);                // USB: debug
   Serial1.begin(LINK_BAUD);            // RX1 pin 19 <- ESP32 GPIO22
-  if (!tft->begin()) Serial.println(F("LCD gagal begin()"));
+  if (!tft->begin(LCD_SPI_HZ)) Serial.println(F("LCD gagal begin()"));
   uiStatic();
   uiUpdate();
 }
