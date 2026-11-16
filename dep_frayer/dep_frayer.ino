@@ -1,8 +1,13 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 38)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 39)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 39 (dari rev 38): LCD dipindah ke ARDUINO MEGA (sketsa lcd_mega/lcd_mega.ino). ESP32 mengirim
+ *   data tampilan lewat UART2 (TX = GPIO22 -> RX1/pin 19 Mega, GND bersama, 115200 bps), satu arah.
+ *   Bingkai teks 1 Hz + saat limit/tahap/PID berubah:  $DF,<field...>*CS  (CS = XOR byte di antara $ dan *).
+ *   Bus SPI ESP32 kini hanya untuk MAX31855; LCD_ENABLE tetap 0.
  *
  * REV 38 (dari rev 37): integral TIDAK PERNAH dinolkan: dibekukan saat TAHAN AMAN (sensor error/
  *   data berhenti), diingat saat STOP PID/STOP dan dipakai lagi saat PID ON (berlaku kedua mode).
@@ -257,7 +262,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 38"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 39"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -289,6 +294,8 @@
 #define PIN_SERVO   13
 #define PIN_TFT_RST 15     // RESET modul layar (dipulsa manual di uiTask)
 #define PIN_BUZZ     2     // buzzer aktif via BC547 (GPIO2 = pin strapping)
+#define PIN_MEGA_TX 22     // rev 39: UART2 TX ke Arduino Mega (RX1 pin 19); RX tidak dipakai
+#define MEGA_BAUD   115200
 #define BUZZER_ACTIVE_HIGH true
 
 // ---------------- LIMIT SWITCH (TABEL KONFIGURASI) ----------------
@@ -1972,6 +1979,56 @@ void broadcastTemp() {
   ws.broadcastTXT(b);
 }
 
+// ---------------- LINK LCD ARDUINO MEGA (rev 39) ----------------
+// Satu baris teks per bingkai, contoh:
+//   $DF,152.31,0,0,150.0,150.00,1,1,0,9.42,0.0,12,5,87,120,5,0,0,1200,PID ON*4A
+// Urutan field: t (nan = sensor error), held, fault, sp, se (nan = PID mati), pe, am, ph, pu, pf,
+//   sv (derajat), uj, us, uf, ls (bit0..3 = limit 0..3 KENA), dc (%), xm (1 = X bergerak), xp (step), pesan.
+// Pesan selalu field terakhir; koma/'*'/'$' di pesan diganti spasi. Serial2 ber-buffer TX 512 byte,
+// jadi write() tidak menahan loop() (1 bingkai ~150 byte = ~13 ms di kabel).
+uint8_t megaLsBits() {
+  uint8_t b = 0;
+  for (int i = 0; i < LS_COUNT; i++) if (lsHit(i)) b |= (1 << i);
+  return b;
+}
+
+void megaSend() {
+  char b[200], m[48];
+  float t = gTemp;
+  int k = 0;
+  for (const char* q = gMsg[0] ? gMsg : "-"; *q && k < (int)sizeof(m) - 1; q++) {
+    char c = *q;
+    m[k++] = (c == ',' || c == '*' || c == '$' || c == '\r' || c == '\n') ? ' ' : c;
+  }
+  m[k] = 0;
+  char ts[12], ses[12];
+  if (isnan(t)) strcpy(ts, "nan"); else snprintf(ts, sizeof(ts), "%.2f", t);
+  if (pidOn) snprintf(ses, sizeof(ses), "%.2f", pidSpEff); else strcpy(ses, "nan");
+  int ph = pidOn ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0;
+  int n = snprintf(b, sizeof(b), "$DF,%s,%d,%d,%.1f,%s,%d,%d,%d,%.2f,%.1f,%d,%d,%ld,%lu,%u,%d,%d,%ld,%s",
+    ts, gTempHeld ? 1 : 0, (int)gFault, (float)gSetpoint, ses, (int)pidOn, (int)pidAdapt, ph, pidOut, pidFf,
+    (int)lroundf(svCurDeg), (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL), (unsigned)megaLsBits(),
+    (int)lroundf(dcCur), stepX.distanceToGo() != 0 ? 1 : 0, stepX.currentPosition(), m);
+  if (n <= 0 || n >= (int)sizeof(b) - 6) return;
+  uint8_t cs = 0;
+  for (int i = 1; i < n; i++) cs ^= (uint8_t)b[i];
+  snprintf(b + n, sizeof(b) - n, "*%02X\n", cs);
+  if (Serial2.availableForWrite() >= (int)strlen(b)) Serial2.write((const uint8_t*)b, strlen(b));
+}
+
+// kirim segera bila limit / tahap Uji Sistem / status PID berubah (maks tiap 100 ms)
+void megaWatch() {
+  static uint8_t lastLs = 0xFF, lastUj = 0xFF, lastPe = 0xFF;
+  static uint32_t lastMs = 0;
+  uint32_t now = millis();
+  if (now - lastMs < 100) return;
+  uint8_t ls = megaLsBits(), uj = ujState, pe = pidOn ? 1 : 0;
+  if (ls != lastLs || uj != lastUj || pe != lastPe) {
+    lastLs = ls; lastUj = uj; lastPe = pe; lastMs = now;
+    megaSend();
+  }
+}
+
 // ---------------- UI TFT + BACA MAX31855 (task di core 0) ----------------
 struct Field { char last[96]; uint16_t color; Field() { last[0] = 1; last[1] = 0; color = 0; } };
 
@@ -2363,6 +2420,8 @@ void setup() {
   buzzInit();
 
   Serial.begin(115200);              // rev 22: tanpa delay (ESP32 tidak perlu menunggu port serial)
+  Serial2.setTxBufferSize(512);      // rev 39: link LCD Mega (TX saja); buffer agar write() tidak menahan loop()
+  Serial2.begin(MEGA_BAUD, SERIAL_8N1, -1, PIN_MEGA_TX);
 
   // rev 22: alasan reset (TASK_WDT = ESP restart karena macet; BROWNOUT = tegangan drop)
   switch (esp_reset_reason()) {
@@ -2436,7 +2495,8 @@ void loop() {
   buzzerUpdate();
 
   pidWatchdog();
-  if (gTempFresh) { gTempFresh = false; pidUpdate(); broadcastTemp(); }   // PID 1 Hz, dari nilai tersaring
+  if (gTempFresh) { gTempFresh = false; pidUpdate(); broadcastTemp(); megaSend(); }   // PID 1 Hz; rev 39: + LCD Mega
+  megaWatch();
 
   unsigned long now = millis();
   if (now - lastStatus >= 250) { lastStatus = now; broadcastStatus(); }
