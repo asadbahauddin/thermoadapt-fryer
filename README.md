@@ -12,7 +12,7 @@ identifikasi sistem (FOPDT) dan tuning PID robust (SIMC) di MATLAB.
 | Folder / file | Isi |
 |---|---|
 | `dep_frayer/dep_frayer.ino` | Firmware ESP32: WiFi AP + web + WebSocket, MAX31855, servo katup gas, motor DC Z (BTS7960), stepper X (TB6600), 4 limit switch, buzzer; sejak rev 39 mengirim data tampilan ke Arduino Mega lewat UART2 |
-| `lcd_mega/lcd_mega.ino` | Arduino Mega 2560: LCD TFT ILI9488 3.5" SPI, menampilkan data dari ESP32 (satu arah) |
+| `lcd_mega/lcd_mega.ino` | Arduino Mega 2560 + shield TFT 2.4" (MCUFRIEND, 320x240): menampilkan data dari ESP32 (satu arah) |
 | `Python/` | Logger data uji via WebSocket: grafik live (suhu vs setpoint, bukaan servo) + CSV semua sensor/aktuator, auto-simpan CSV & PNG saat berhenti |
 | `Program/` | Model Simulink Adaptive PID + simulasi (parameter plant masih asumsi) |
 | `Program/step_test/` | Identifikasi FOPDT dari data step test + tuning PI SIMC + cek robustness (Ms, PM, GM) |
@@ -23,22 +23,18 @@ identifikasi sistem (FOPDT) dan tuning PID robust (SIMC) di MATLAB.
 
 ESP32 DevKit V1 30-pin · thermocouple K + MAX31855 · servo 180° pada katup gas ·
 motor DC + BTS7960 (sumbu Z) · stepper NEMA + TB6600 (sumbu X) · 4 limit switch ·
-Arduino Mega 2560 + TFT ILI9488 3.5" SPI (layar).
+Arduino Mega 2560 + shield TFT 2.4" (layar).
 
 ### LCD di Arduino Mega (firmware rev 39)
 
+Shield TFT 2.4" (jenis MCUFRIEND, data paralel, 5 V) ditancap langsung ke Mega, tanpa level converter.
+Touch dan slot SD shield tidak dipakai. Library Mega: *MCUFRIEND_kbv* + *Adafruit GFX Library*.
+
 | Dari | Ke | Catatan |
 |---|---|---|
-| ESP32 GPIO22 (TX2) | Mega pin 19 (RX1) | 115200 bps, data satu arah |
+| ESP32 GPIO22 (TX2) | Mega pin 19 (RX1) | 115200 bps, data satu arah, langsung |
 | ESP32 GND | Mega GND | wajib, ground bersama |
-| Mega 52 (SCK) | LCD SCK | lewat level shifter 5 V → 3,3 V |
-| Mega 51 (MOSI) | LCD SDI (MOSI) | lewat level shifter |
-| Mega 49 | LCD CS | lewat level shifter |
-| Mega 48 | LCD DC/RS | lewat level shifter |
-| Mega 47 | LCD RESET | lewat level shifter |
-| 5 V / GND | LCD VCC / GND | VCC 5 V hanya bila modul punya regulator 3,3 V onboard |
 
-LCD SDO (MISO) dan pin touch tidak dipakai. Library Mega: *GFX Library for Arduino* (moononournation).
 Bingkai dari ESP32: `$DF,t,held,fault,sp,se,pe,am,ph,pu,pf,sv,uj,us,uf,ls,dc,xm,xp,pesan*CS` (CS = XOR byte di antara `$` dan `*`).
 
 ## Logger data (Python)
