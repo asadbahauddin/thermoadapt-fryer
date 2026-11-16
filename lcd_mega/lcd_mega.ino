@@ -303,8 +303,8 @@ void uiUpdate() {
 
   putText(fMsg, d.msg, 4, 202, 1, C_YELLOW, 312);
 
-  // baris WiFi seperti LCD lama (rev 41)
-  snprintf_P(b, sizeof(b), PSTR("%s IP %s klien:%d up:%lus"), d.ssid, d.ip, d.wc, d.up);
+  // baris IP (rev 41; SSID/klien/uptime tetap dikirim ESP32 tapi tidak ditampilkan)
+  snprintf_P(b, sizeof(b), PSTR("IP %s"), d.ip);
   putText(fWifi, b, 4, 215, 1, C_LGREY, 312);
 
   snprintf_P(b, sizeof(b), PSTR("Servo %d deg | timer %lds | OK %lu rusak %lu"), d.sv, d.uf, nOk, nBad);
