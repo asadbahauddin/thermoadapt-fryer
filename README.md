@@ -11,8 +11,8 @@ identifikasi sistem (FOPDT) dan tuning PID robust (SIMC) di MATLAB.
 
 | Folder / file | Isi |
 |---|---|
-| `dep_frayer/dep_frayer.ino` | Firmware ESP32: WiFi AP + web + WebSocket, MAX31855, servo katup gas, motor DC Z (BTS7960), stepper X (TB6600), 4 limit switch, buzzer; sejak rev 39 mengirim data tampilan ke Arduino Mega lewat UART2 |
-| `lcd_mega/lcd_mega.ino` | Arduino Mega 2560 + shield TFT 2.4" (MCUFRIEND, 320x240): menampilkan data dari ESP32 (satu arah) |
+| `dep_frayer/dep_frayer.ino` | Firmware ESP32: WiFi AP + web + WebSocket, MAX31855, servo katup gas, motor DC Z (BTS7960), stepper X (TB6600), 4 limit switch, buzzer; sejak rev 39 mengirim data tampilan ke Arduino layar lewat UART2 |
+| `lcd_mega/lcd_mega.ino` | Arduino UNO + shield TFT 2.4" (MCUFRIEND, 320x240): menampilkan data dari ESP32 (satu arah) |
 | `Python/` | Logger data uji via WebSocket: grafik live (suhu vs setpoint, bukaan servo) + CSV semua sensor/aktuator, auto-simpan CSV & PNG saat berhenti |
 | `Program/` | Model Simulink Adaptive PID + simulasi (parameter plant masih asumsi) |
 | `Program/step_test/` | Identifikasi FOPDT dari data step test + tuning PI SIMC + cek robustness (Ms, PM, GM) |
@@ -23,17 +23,18 @@ identifikasi sistem (FOPDT) dan tuning PID robust (SIMC) di MATLAB.
 
 ESP32 DevKit V1 30-pin · thermocouple K + MAX31855 · servo 180° pada katup gas ·
 motor DC + BTS7960 (sumbu Z) · stepper NEMA + TB6600 (sumbu X) · 4 limit switch ·
-Arduino Mega 2560 + shield TFT 2.4" (layar).
+Arduino UNO + shield TFT 2.4" (layar).
 
-### LCD di Arduino Mega (firmware rev 39)
+### Layar di Arduino UNO (firmware rev 40)
 
-Shield TFT 2.4" (jenis MCUFRIEND, data paralel, 5 V) ditancap langsung ke Mega, tanpa level converter.
-Touch dan slot SD shield tidak dipakai. Library Mega: *MCUFRIEND_kbv* + *Adafruit GFX Library*.
+Shield TFT 2.4" (jenis MCUFRIEND, data paralel, 5 V) ditancap langsung ke UNO. Touch dan slot SD tidak dipakai.
+Library UNO: *MCUFRIEND_kbv* + *Adafruit GFX Library*. Data diterima lewat SoftwareSerial (pin 0/1 dipakai USB).
 
 | Dari | Ke | Catatan |
 |---|---|---|
-| ESP32 GPIO22 (TX2) | Mega pin 19 (RX1) | 115200 bps, data satu arah, langsung |
-| ESP32 GND | Mega GND | wajib, ground bersama |
+| ESP32 GPIO22 (TX2) | level shifter LV1 | sisi 3,3 V (LV = 3V3 ESP32) |
+| level shifter HV1 | UNO A5 | sisi 5 V (HV = 5V UNO), 19200 bps, data satu arah |
+| ESP32 GND, UNO GND | GND level shifter | wajib, ground bersama (GND UNO mis. pin 6 header ICSP) |
 
 Bingkai dari ESP32: `$DF,t,held,fault,sp,se,pe,am,ph,pu,pf,sv,uj,us,uf,ls,dc,xm,xp,pesan*CS` (CS = XOR byte di antara `$` dan `*`).
 

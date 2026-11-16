@@ -1,8 +1,11 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 39)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 40)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 40 (dari rev 39): layar pindah ke ARDUINO UNO + shield TFT 2.4" (sketsa lcd_mega/lcd_mega.ino).
+ *   UNO menerima lewat SoftwareSerial di A5 -> kecepatan link diturunkan ke 19200 bps (115200 tidak andal).
  *
  * REV 39 (dari rev 38): LCD dipindah ke ARDUINO MEGA (sketsa lcd_mega/lcd_mega.ino). ESP32 mengirim
  *   data tampilan lewat UART2 (TX = GPIO22 -> RX1/pin 19 Mega, GND bersama, 115200 bps), satu arah.
@@ -262,7 +265,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 39"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 40"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -294,8 +297,8 @@
 #define PIN_SERVO   13
 #define PIN_TFT_RST 15     // RESET modul layar (dipulsa manual di uiTask)
 #define PIN_BUZZ     2     // buzzer aktif via BC547 (GPIO2 = pin strapping)
-#define PIN_MEGA_TX 22     // rev 39: UART2 TX ke Arduino Mega (RX1 pin 19); RX tidak dipakai
-#define MEGA_BAUD   115200
+#define PIN_MEGA_TX 22     // rev 39: UART2 TX ke Arduino layar (rev 40: UNO pin A5); RX tidak dipakai
+#define MEGA_BAUD   19200  // rev 40: SoftwareSerial UNO tidak andal di 115200
 #define BUZZER_ACTIVE_HIGH true
 
 // ---------------- LIMIT SWITCH (TABEL KONFIGURASI) ----------------
@@ -1985,7 +1988,7 @@ void broadcastTemp() {
 // Urutan field: t (nan = sensor error), held, fault, sp, se (nan = PID mati), pe, am, ph, pu, pf,
 //   sv (derajat), uj, us, uf, ls (bit0..3 = limit 0..3 KENA), dc (%), xm (1 = X bergerak), xp (step), pesan.
 // Pesan selalu field terakhir; koma/'*'/'$' di pesan diganti spasi. Serial2 ber-buffer TX 512 byte,
-// jadi write() tidak menahan loop() (1 bingkai ~150 byte = ~13 ms di kabel).
+// jadi write() tidak menahan loop() (1 bingkai ~150 byte = ~80 ms di kabel pada 19200 bps).
 uint8_t megaLsBits() {
   uint8_t b = 0;
   for (int i = 0; i < LS_COUNT; i++) if (lsHit(i)) b |= (1 << i);
