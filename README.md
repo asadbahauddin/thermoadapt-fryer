@@ -25,7 +25,7 @@ ESP32 DevKit V1 30-pin · thermocouple K + MAX31855 · servo 180° pada katup ga
 motor DC + BTS7960 (sumbu Z) · stepper NEMA + TB6600 (sumbu X) · 4 limit switch ·
 Arduino UNO + shield TFT 2.4" (layar).
 
-### Layar di Arduino UNO (firmware rev 40)
+### Layar di Arduino UNO (firmware rev 41)
 
 Shield TFT 2.4" (jenis MCUFRIEND, data paralel, 5 V) ditancap langsung ke UNO. Touch dan slot SD tidak dipakai.
 Library UNO: *MCUFRIEND_kbv* + *Adafruit GFX Library*. Data diterima lewat SoftwareSerial (pin 0/1 dipakai USB).
@@ -36,7 +36,7 @@ Library UNO: *MCUFRIEND_kbv* + *Adafruit GFX Library*. Data diterima lewat Softw
 | level shifter HV1 | UNO A5 | sisi 5 V (HV = 5V UNO), 19200 bps, data satu arah |
 | ESP32 GND, UNO GND | GND level shifter | wajib, ground bersama (GND UNO mis. pin 6 header ICSP) |
 
-Bingkai dari ESP32: `$DF,t,held,fault,sp,se,pe,am,ph,pu,pf,sv,uj,us,uf,ls,dc,xm,xp,pesan*CS` (CS = XOR byte di antara `$` dan `*`).
+Bingkai dari ESP32: `$DF,t,held,fault,sp,se,pe,am,ph,pu,pf,sv,uj,us,uf,ls,dc,xm,xp,ssid,ip,wc,up,pesan*CS` (CS = XOR byte di antara `$` dan `*`).
 
 ## Logger data (Python)
 

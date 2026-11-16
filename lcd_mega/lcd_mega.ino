@@ -1,5 +1,5 @@
 /*
- * DEEP FRYER CERDAS - LCD DI ARDUINO UNO (pasangan firmware ESP32 rev 40)
+ * DEEP FRYER CERDAS - LCD DI ARDUINO UNO (pasangan firmware ESP32 rev 41)
  * (nama file tetap lcd_mega.ino; isi untuk Arduino UNO)
  * UNO hanya MENAMPILKAN data; semua kontrol tetap di ESP32 (web). Satu arah: ESP32 -> UNO.
  *
@@ -14,7 +14,7 @@
  *   Pin 11 dipakai sebagai TX SoftwareSerial (tidak disambung ke mana pun).
  *
  * PROTOKOL (dari ESP32, 1 Hz + saat limit/tahap/PID berubah), satu baris:
- *   $DF,t,held,fault,sp,se,pe,am,ph,pu,pf,sv,uj,us,uf,ls,dc,xm,xp,pesan*CS\n
+ *   $DF,t,held,fault,sp,se,pe,am,ph,pu,pf,sv,uj,us,uf,ls,dc,xm,xp,ssid,ip,wc,up,pesan*CS\n
  *   CS = XOR semua byte di antara '$' dan '*', dua digit hex. Bingkai dengan CS salah dibuang.
  *
  * RAM UNO hanya 2 KB: teks format disimpan di flash (PSTR/F), elemen layar hanya menyimpan hash.
@@ -56,13 +56,16 @@ struct Data {
   float t, sp, se, pu, pf;
   int held, fault, pe, am, ph, sv, uj, ls, dc, xm;
   long us, uf, xp;
+  char ssid[20], ip[16];
+  int wc;
+  unsigned long up;
   char msg[48];
 };
 Data d;
 bool haveData = false;
 uint32_t lastFrameMs = 0, nOk = 0, nBad = 0;
 
-char line[180];
+char line[230];
 uint8_t lineLen = 0;
 bool newSample = false;
 uint32_t lastPush = 0;
@@ -91,18 +94,21 @@ bool parseFrame(char* s) {
   *star = 0;
   if (strncmp_P(s, PSTR("$DF,"), 4) != 0) return false;
 
-  char* f[19];
+  char* f[23];
   uint8_t n = 0;
   char* p = s + 4;
   f[n++] = p;
-  while (*p && n < 19) { if (*p == ',') { *p = 0; f[n++] = p + 1; } p++; }
-  if (n != 19) return false;                    // 18 field angka + pesan
+  while (*p && n < 23) { if (*p == ',') { *p = 0; f[n++] = p + 1; } p++; }
+  if (n != 23) return false;                    // 22 field + pesan (rev 41)
 
   d.t = toF(f[0]); d.held = atoi(f[1]); d.fault = atoi(f[2]); d.sp = toF(f[3]); d.se = toF(f[4]);
   d.pe = atoi(f[5]); d.am = atoi(f[6]); d.ph = atoi(f[7]); d.pu = toF(f[8]); d.pf = toF(f[9]);
   d.sv = atoi(f[10]); d.uj = atoi(f[11]); d.us = atol(f[12]); d.uf = atol(f[13]); d.ls = atoi(f[14]);
   d.dc = atoi(f[15]); d.xm = atoi(f[16]); d.xp = atol(f[17]);
-  strncpy(d.msg, f[18], sizeof(d.msg) - 1); d.msg[sizeof(d.msg) - 1] = 0;
+  strncpy(d.ssid, f[18], sizeof(d.ssid) - 1); d.ssid[sizeof(d.ssid) - 1] = 0;
+  strncpy(d.ip, f[19], sizeof(d.ip) - 1); d.ip[sizeof(d.ip) - 1] = 0;
+  d.wc = atoi(f[20]); d.up = strtoul(f[21], NULL, 10);
+  strncpy(d.msg, f[22], sizeof(d.msg) - 1); d.msg[sizeof(d.msg) - 1] = 0;
   return true;
 }
 
@@ -228,7 +234,7 @@ void uiStatic() {
 }
 
 int8_t lHit[4] = { -1, -1, -1, -1 };
-Field fLink, fTemp, fSp, fPid, fValve, fUj, fZX, fMsg, fFoot;
+Field fLink, fTemp, fSp, fPid, fValve, fUj, fZX, fMsg, fWifi, fFoot;
 
 void uiUpdate() {
   char b[56], v1[10], v2[10], un[14];
@@ -240,7 +246,7 @@ void uiUpdate() {
     strcpy_P(b, PSTR("--.-C"));
     putText(fTemp, b, 4, 24, 5, C_GREY, 184);
     strcpy_P(b, PSTR("Cek kabel ESP32 GPIO22 -> A5 dan GND"));
-    putText(fMsg, b, 4, 214, 1, C_YELLOW, 312);
+    putText(fMsg, b, 4, 202, 1, C_YELLOW, 312);
     return;
   }
 
@@ -293,12 +299,16 @@ void uiUpdate() {
   // Z dan X
   snprintf_P(b, sizeof(b), PSTR("Z %d%% %S | X %ld %S"), d.dc,
              d.dc > 0 ? PSTR("NAIK") : (d.dc < 0 ? PSTR("TURUN") : PSTR("diam")), d.xp, d.xm ? PSTR("gerak") : PSTR("diam"));
-  putText(fZX, b, 4, 194, 1, C_WHITE, 312);
+  putText(fZX, b, 4, 190, 1, C_WHITE, 312);
 
-  putText(fMsg, d.msg, 4, 214, 1, C_YELLOW, 312);
+  putText(fMsg, d.msg, 4, 202, 1, C_YELLOW, 312);
+
+  // baris WiFi seperti LCD lama (rev 41)
+  snprintf_P(b, sizeof(b), PSTR("%s IP %s klien:%d up:%lus"), d.ssid, d.ip, d.wc, d.up);
+  putText(fWifi, b, 4, 215, 1, C_LGREY, 312);
 
   snprintf_P(b, sizeof(b), PSTR("Servo %d deg | timer %lds | OK %lu rusak %lu"), d.sv, d.uf, nOk, nBad);
-  putText(fFoot, b, 4, 230, 1, C_GREY, 312);
+  putText(fFoot, b, 4, 229, 1, C_GREY, 312);
 }
 
 void setup() {

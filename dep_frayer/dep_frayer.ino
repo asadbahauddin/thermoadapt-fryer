@@ -1,8 +1,10 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 40)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 41)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 41 (dari rev 40): bingkai layar UNO ditambah baris WiFi: SSID, IP AP, jumlah klien, uptime (dtk).
  *
  * REV 40 (dari rev 39): layar pindah ke ARDUINO UNO + shield TFT 2.4" (sketsa lcd_mega/lcd_mega.ino).
  *   UNO menerima lewat SoftwareSerial di A5 -> kecepatan link diturunkan ke 19200 bps (115200 tidak andal).
@@ -265,7 +267,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 40"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 41"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -1986,7 +1988,8 @@ void broadcastTemp() {
 // Satu baris teks per bingkai, contoh:
 //   $DF,152.31,0,0,150.0,150.00,1,1,0,9.42,0.0,12,5,87,120,5,0,0,1200,PID ON*4A
 // Urutan field: t (nan = sensor error), held, fault, sp, se (nan = PID mati), pe, am, ph, pu, pf,
-//   sv (derajat), uj, us, uf, ls (bit0..3 = limit 0..3 KENA), dc (%), xm (1 = X bergerak), xp (step), pesan.
+//   sv (derajat), uj, us, uf, ls (bit0..3 = limit 0..3 KENA), dc (%), xm (1 = X bergerak), xp (step),
+//   rev 41: ssid, ip, wc (klien WiFi), up (uptime dtk), lalu pesan.
 // Pesan selalu field terakhir; koma/'*'/'$' di pesan diganti spasi. Serial2 ber-buffer TX 512 byte,
 // jadi write() tidak menahan loop() (1 bingkai ~150 byte = ~80 ms di kabel pada 19200 bps).
 uint8_t megaLsBits() {
@@ -1996,7 +1999,7 @@ uint8_t megaLsBits() {
 }
 
 void megaSend() {
-  char b[200], m[48];
+  char b[260], m[48];
   float t = gTemp;
   int k = 0;
   for (const char* q = gMsg[0] ? gMsg : "-"; *q && k < (int)sizeof(m) - 1; q++) {
@@ -2008,10 +2011,11 @@ void megaSend() {
   if (isnan(t)) strcpy(ts, "nan"); else snprintf(ts, sizeof(ts), "%.2f", t);
   if (pidOn) snprintf(ses, sizeof(ses), "%.2f", pidSpEff); else strcpy(ses, "nan");
   int ph = pidOn ? (pidSafeWhy ? (int)pidSafeWhy : (pidHold ? 1 : 0)) : 0;
-  int n = snprintf(b, sizeof(b), "$DF,%s,%d,%d,%.1f,%s,%d,%d,%d,%.2f,%.1f,%d,%d,%ld,%lu,%u,%d,%d,%ld,%s",
+  int n = snprintf(b, sizeof(b), "$DF,%s,%d,%d,%.1f,%s,%d,%d,%d,%.2f,%.1f,%d,%d,%ld,%lu,%u,%d,%d,%ld,%s,%u.%u.%u.%u,%d,%lu,%s",
     ts, gTempHeld ? 1 : 0, (int)gFault, (float)gSetpoint, ses, (int)pidOn, (int)pidAdapt, ph, pidOut, pidFf,
     (int)lroundf(svCurDeg), (int)ujState, ujSecs(), (unsigned long)(ujFryMs / 1000UL), (unsigned)megaLsBits(),
-    (int)lroundf(dcCur), stepX.distanceToGo() != 0 ? 1 : 0, stepX.currentPosition(), m);
+    (int)lroundf(dcCur), stepX.distanceToGo() != 0 ? 1 : 0, stepX.currentPosition(),
+    AP_SSID, AP_IP[0], AP_IP[1], AP_IP[2], AP_IP[3], (int)WiFi.softAPgetStationNum(), millis() / 1000UL, m);
   if (n <= 0 || n >= (int)sizeof(b) - 6) return;
   uint8_t cs = 0;
   for (int i = 1; i < n; i++) cs ^= (uint8_t)b[i];
