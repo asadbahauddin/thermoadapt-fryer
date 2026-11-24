@@ -1,6 +1,6 @@
 """Uji fitur Uji Sistem (rev 33) TANPA hardware:  python uji_sistem.py
 
-1. Cek statis dep_frayer.ino: konstanta sesuai permintaan (rentang SP+-3, 30 dtk, turun 50%,
+1. Cek statis dep_frayer.ino: konstanta sesuai permintaan (rentang SP+-3, 5 dtk, turun 50%,
    naik 60%, timer default 120 dtk), urutan tahap, STOP membatalkan, gerak manual ditolak, gerak uji
    tanpa batas waktu, jumlah format snprintf JSON "temp" = jumlah argumen.
 2. Simulasi garis waktu (porting ujUpdate + model mekanik Z/X + limit switch), langkah 10 ms.
@@ -35,7 +35,7 @@ class UjiStatis(unittest.TestCase):
     def test_konstanta_permintaan(self):
         self.assertEqual(d("UJ_BAND_LO_C"), 3.0)
         self.assertEqual(d("UJ_BAND_HI_C"), 3.0)
-        self.assertEqual(d("UJ_STABLE_MS"), 30000)
+        self.assertEqual(d("UJ_STABLE_MS"), 5000)
         self.assertEqual(d("UJ_PCT_DOWN"), 50)
         self.assertEqual(d("UJ_PCT_UP"), 60)
         self.assertEqual(d("UJ_FRY_DEFAULT_S"), 120)
@@ -227,7 +227,7 @@ class UjiGarisWaktu(unittest.TestCase):
         sim = SimUji(Fryer(z=100, x=0, temps=temps))
         sim.run(60_000)
         t4 = dict((s, ms) for ms, s in sim.log)[4]
-        self.assertEqual(t4, 56_000)                          # 26 dtk + 30 dtk berturut-turut
+        self.assertEqual(t4, 31_000)                          # 26 dtk + 5 dtk berturut-turut (rev 42)
 
     def test_osilasi_keluar_rentang_tidak_turun(self):           # rev 36: 157..167 bolak-balik = belum stabil
         temps = lambda t: 162.0 + 5.0 * (((int(t) // 5) % 2) * 2 - 1)          # 157 / 167 tiap 5 dtk
