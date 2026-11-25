@@ -39,12 +39,12 @@ class Pid:
         self.prev_valid = False
         self.last_ms = 0
         self.alasan_mati = None
-        self.ff_on, self.ff_ms, self.ff = False, 0, 0.0      # rev 34: feedforward beban
+        self.ff_on, self.ff_ms, self.ff, self.ff_dip = False, 0, 0.0, False     # rev 34: feedforward beban
         self.I_mem = 0.0                                     # rev 38: integral terakhir saat STOP
 
     def ff_start(self, ms):                              # pidFfStart (dipanggil di tahap 4 Uji Sistem)
         if FF_PCT > 0 and self.on:
-            self.ff_on, self.ff_ms = True, ms
+            self.ff_on, self.ff_ms, self.ff_dip = True, ms, False   # rev 43
 
     def ff_cancel(self):
         self.ff_on, self.ff = False, 0.0
@@ -133,7 +133,9 @@ class Pid:
         self.ff = 0.0
         if self.ff_on:
             tf = max((ms - self.ff_ms) / 1000.0, 0.0)
-            if tf > 5.0 * FF_TAU:
+            if t < self.sp_eff - 2.0:                      # rev 43: beban sudah terasa
+                self.ff_dip = True
+            if tf > 5.0 * FF_TAU or (self.ff_dip and t >= self.sp_eff):   # rev 43: suhu pulih -> FF selesai
                 self.ff_on = False
             elif t < self.sp_eff:
                 self.ff = FF_PCT * math.exp(-tf / FF_TAU)
@@ -315,16 +317,20 @@ class UjiFeedforward(unittest.TestCase):                                  # rev 
                     print("\n  [plant terkalibrasi] %-12s L=%d: suhu terendah %.1f -> %.1f C, IAE %.0f -> %.0f, maks %.1f -> %.1f"
                           % ("adaptif" if adapt else "konvensional", L, tmin0, tmin1, iae0, iae1, tmax0, tmax1))
 
-    def test_ff_ditahan_saat_suhu_di_atas_setpoint(self):
+    def test_ff_selesai_permanen_saat_suhu_pulih(self):    # rev 43 (dulu FF hidup lagi tiap T < SP)
         p = Pid(adapt=False)
-        p.enable(155.0, 0, False, 150.0, 10.0)
+        p.enable(145.0, 0, False, 150.0, 10.0)
         p.sp_eff = 150.0
         p.ff_start(0)
-        p.update(155.0, 1000, False, 150.0, 1000, 1000)
+        p.update(150.5, 500, False, 150.0, 500, 500)         # sebelum beban terasa (T >= SP): FF menunggu
+        self.assertTrue(p.ff_on)
+        p.update(145.0, 1000, False, 150.0, 1000, 1000)     # di bawah SP: FF bekerja
+        self.assertAlmostEqual(p.ff, FF_PCT * math.exp(-1.0 / FF_TAU), places=4)
+        p.update(150.2, 2000, False, 150.0, 2000, 2000)     # suhu pulih ke SP: FF selesai
         self.assertEqual(p.ff, 0.0)
-        self.assertTrue(p.ff_on)                            # tidak dibatalkan, hanya ditahan
-        p.update(149.0, 2000, False, 150.0, 2000, 2000)
-        self.assertAlmostEqual(p.ff, FF_PCT * math.exp(-2.0 / FF_TAU), places=4)
+        self.assertFalse(p.ff_on)
+        p.update(149.0, 3000, False, 150.0, 3000, 3000)     # turun sedikit lagi: FF TIDAK hidup lagi
+        self.assertEqual(p.ff, 0.0)
 
     def test_ff_batal_saat_tahan_overshoot_dan_meluruh(self):
         p = Pid()

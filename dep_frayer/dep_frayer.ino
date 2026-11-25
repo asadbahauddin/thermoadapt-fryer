@@ -1,8 +1,14 @@
 /*
- * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 42)
+ * DEEP FRYER CERDAS - MONITOR & KONTROL VIA WEB + LCD (rev 43)
  * ESP32 = WiFi Access Point (192.168.4.1) + WebSocket.
  * Isi: suhu MAX31855, 4 limit switch, Z = MOTOR DC (BTS7960), X = stepper (TB6600),
  *      SERVO katup gas 0-180 derajat (kalibrasi), BUZZER, LCD TFT mirror dari web.
+ *
+ * REV 43 (dari rev 42): feedforward beban BERHENTI PERMANEN begitu suhu, setelah sempat turun >= 2 C di bawah
+ *   setpoint efektif karena beban, kembali mencapai setpoint efektif.
+ *   Dulu FF hanya dinolkan per sampel saat T >= SP, lalu HIDUP LAGI (10-25 %) tiap kali suhu turun sedikit
+ *   di bawah SP. Log 1 Nov: 3-8 kali per sesi katup melonjak dekat SP -> overshoot sampai SP+10..22 C
+ *   (TAHAN + buzzer). Sekarang FF hanya bekerja satu kali per penurunan keranjang, sampai suhu pulih.
  *
  * REV 42 (dari rev 41): Uji Sistem - suhu dianggap stabil setelah 5 dtk berturut-turut di SP +-3 C
  *   (dulu 30 dtk), atas permintaan pengguna.
@@ -270,7 +276,7 @@
 #include <AccelStepper.h>
 #include <esp_task_wdt.h>         // rev 22: watchdog (ESP restart sendiri bila macet)
 
-#define FW_REV "rev 42"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
+#define FW_REV "rev 43"     // tampil di judul halaman web: cek apakah firmware terbaru sudah ter-upload
 
 // ---- ROBUST (rev 22) ----
 #define LCD_ENABLE      0         // rev 31: 0 = LCD DIMATIKAN; bus SPI hanya untuk MAX31855 (fokus termokopel).
@@ -427,6 +433,7 @@ static_assert(SENSOR_HOLD_MS < SENSOR_FAULT_MS, "SENSOR_HOLD_MS harus < SENSOR_F
 // suhu terendah 136.3 -> 142.2 C, IAE -29%, suhu maks +0.4 C (L 10 s); tetap aman pada L 30 s.
 #define PID_FF_PCT         25.0f     // 0 = feedforward MATI
 #define PID_FF_TAU_S       90.0f
+#define PID_FF_DIP_C       2.0f      // rev 43: FF berakhir saat suhu pulih ke SP setelah turun >= ini
 
 // ---- ADAPTIVE PID (rev 17), hukum adaptasi SAMA dgn model Simulink (build_deep_fryer_model.m) ----
 //   Kp(k) = min(Kp0 + lambda_p*|e(k)|,     max(Kp0, PID_KP_MAX))
@@ -1448,7 +1455,8 @@ bool     pidFfOn = false;         // rev 34: feedforward beban sedang berjalan
 uint32_t pidFfMs = 0;             //   waktu mulai FF
 float    pidFf = 0;               //   FF yang dipakai sampel terakhir (persen, untuk web/logger)
 
-void pidFfStart() { if (PID_FF_PCT > 0 && pidOn) { pidFfOn = true; pidFfMs = millis(); } }
+bool     pidFfDip = false;        // rev 43: suhu sudah turun >= PID_FF_DIP_C di bawah SP sejak FF mulai
+void pidFfStart() { if (PID_FF_PCT > 0 && pidOn) { pidFfOn = true; pidFfDip = false; pidFfMs = millis(); } }
 void pidFfCancel() { pidFfOn = false; pidFf = 0; }
 
 float servoOpeningPct() {         // bukaan servo sekarang (target) dalam persen TUTUP..BUKA
@@ -1592,7 +1600,8 @@ void pidUpdate() {
   if (pidFfOn) {
     float tf = (float)(int32_t)(s.ms - pidFfMs) / 1000.0f;   // bertanda: sampel bisa sedikit lebih tua dari mulai FF
     if (tf < 0.0f) tf = 0.0f;
-    if (tf > 5.0f * PID_FF_TAU_S) pidFfOn = false;
+    if (T < pidSpEff - PID_FF_DIP_C) pidFfDip = true;            // rev 43: beban sudah terasa
+    if (tf > 5.0f * PID_FF_TAU_S || (pidFfDip && T >= pidSpEff)) pidFfOn = false;   // rev 43: suhu pulih -> FF selesai
     else if (T < pidSpEff) pidFf = PID_FF_PCT * expf(-tf / PID_FF_TAU_S);
   }
   float uUnsat = pidKpEff * e + pidI - pidKdEff * pidDf + pidFf;
